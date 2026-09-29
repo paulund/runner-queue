@@ -497,3 +497,94 @@ test("lint treats a flow-sequence runs-on as one conjunction, not alternatives",
   });
   assert.ok(out.find((f) => f.rule === "unmatched-labels"));
 });
+
+// --- fleet sizing: demand must not include the wait it is measuring ---
+
+const histWithRuns = ({ n = 236, days = 13, durationS = 600, waitS = 0 }) => ({
+  overall: { n: 498, mean: 2000, p50: 60, p90: 1200, max: 3000 },
+  daily: Array.from({ length: days }, (_, i) => ({
+    day: `2026-01-${String(i + 1).padStart(2, "0")}`,
+    n,
+  })),
+  blockedHours: { totalHours: 71, days, series: [] },
+  timeToGreen: {
+    samples: Array.from({ length: n }, () => ({ durationS })),
+  },
+});
+
+test("fleet demand is measured from execution time, not total run time", () => {
+  // Regression: total run time includes queue wait, so sizing from it folds
+  // the very delay being measured back into demand and over-estimates it.
+  const out = recommendFleet({
+    history: histWithRuns({ n: 236, days: 13, durationS: 600 }),
+    capacity: { total: 4, idle: 0 },
+  });
+  // 498 jobs / 13 days * 600s = 6.4 runner-hours per day against 96 supplied.
+  // Measured from total run time instead, the same week reads far higher.
+  assert.ok(out.demandHoursPerDay < 10, `demand was ${out.demandHoursPerDay}`);
+  assert.equal(out.verdict, "healthy");
+});
+
+test("fleet demand spreads across elapsed days, not only active days", () => {
+  // A quiet stretch should dilute jobs-per-day; dividing by the number of days
+  // that happened to have runs would overstate daily demand.
+  const sparse = recommendFleet({
+    history: histWithRuns({ n: 236, days: 13, durationS: 600 }),
+    capacity: { total: 4, idle: 0 },
+  });
+  const single = recommendFleet({
+    history: histWithRuns({ n: 236, days: 1, durationS: 600 }),
+    capacity: { total: 4, idle: 0 },
+  });
+  assert.ok(
+    single.demandHoursPerDay > sparse.demandHoursPerDay,
+    "one busy day should show higher daily demand than the same work spread out",
+  );
+});
+
+test("fleet sizing is stable as the sample window shifts", () => {
+  // The dashboard and the CLI fetch at different moments, so the same week
+  // arrives with a different number of days and jobs. The verdict must not
+  // flip between them.
+  const cap = { total: 1, idle: 0 };
+  const a = recommendFleet({ history: histWithRuns({ days: 13, n: 236 }), capacity: cap });
+  const b = recommendFleet({ history: histWithRuns({ days: 11, n: 236 }), capacity: cap });
+  assert.equal(a.verdict, b.verdict);
+  assert.equal(a.add, b.add);
+});
+
+test("timeToGreen reports the shortest job wait as the run's queue delay", () => {
+  // A run is delayed by how long its first job waited, not by an arbitrary
+  // job's wait; parallel jobs would otherwise inflate the run's share.
+  const out = summarise([
+    job({ runId: 7, waitS: 500, runCreatedAt: "2026-01-01T00:00:00Z", runUpdatedAt: "2026-01-01T00:20:00Z" }),
+    job({ runId: 7, waitS: 60, runCreatedAt: "2026-01-01T00:00:00Z", runUpdatedAt: "2026-01-01T00:20:00Z" }),
+  ]);
+  assert.equal(out.timeToGreen.n, 1);
+  const sample = out.timeToGreen.samples[0];
+  // 1200s total minus the 60s it waited is the time it was actually running.
+  assert.equal(sample.durationS, 1140);
+});
+
+test("a rate-limited GitHub call surfaces an actionable message, not gh stderr", async () => {
+  // The raw error contains a support request id and is unusable in a browser.
+  const { friendlyError } = await import("../src/server.js");
+  const ghFailure = Object.assign(new Error("Command failed"), {
+    stderr:
+      "gh: API rate limit exceeded for user ID 1. request ID ABC:123 timestamp 2026-01-01",
+  });
+  const message = friendlyError(ghFailure);
+  assert.match(message, /rate limit/i);
+  assert.doesNotMatch(message, /request ID/);
+  assert.doesNotMatch(message, /user ID 1/);
+});
+
+test("a missing admin:org scope is reported with the command to fix it", async () => {
+  const { friendlyError } = await import("../src/server.js");
+  const message = friendlyError(
+    Object.assign(new Error("Command failed"), {
+      stderr: "This API operation needs the \"admin:org\" scope.",
+    }),
+  );
+  assert.match(message, /gh auth refresh/);
+});

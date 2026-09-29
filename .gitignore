@@ -3,3 +3,4 @@ node_modules/
 runner-queue.config.json
 *.log
 .cache/
+.playwright-cli/

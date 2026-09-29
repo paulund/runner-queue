@@ -10,7 +10,7 @@ import {
   api,
 } from "./github.js";
 import { buildQueue, capacitySummary } from "./diagnose.js";
-import { filterRepos } from "./config.js";
+import { filterRepos, cacheFile } from "./config.js";
 import {
   findSuperseded,
   recommendFleet,
@@ -78,6 +78,7 @@ export function startServer(config, { port = 7777, host = "127.0.0.1" } = {}) {
     const hist = await collectHistory(repos, {
       days: config.historyDays,
       sample: config.historySample,
+      cachePath: cacheFile(config),
     });
     const { runners, error: runnerError } = await listOrgRunners(org);
     const capacity = capacitySummary(runnerError ? null : runners);
@@ -250,14 +251,22 @@ export function startServer(config, { port = 7777, host = "127.0.0.1" } = {}) {
         return res.end(renderSnapshot(p));
       }
 
+      if (url.pathname === "/favicon.ico") {
+        res.writeHead(204).end();
+        return;
+      }
+
       const file = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
       const body = await readFile(join(publicDir, file));
       const ext = file.slice(file.lastIndexOf("."));
       res.writeHead(200, { "content-type": MIME[ext] ?? "text/plain" });
       res.end(body);
     } catch (err) {
-      res.writeHead(500, { "content-type": "text/plain" });
-      res.end(String(err?.message ?? err));
+      // Never leak the raw `gh` stderr into the response: it is noisy, it can
+      // contain a rate-limit request id, and the UI has no use for it.
+      const message = friendlyError(err);
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: message }));
     }
   });
 
@@ -280,6 +289,21 @@ const esc = (s) =>
     /[&<>"]/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
   );
+
+/** Turns a `gh` failure into one line a person can act on. */
+export function friendlyError(err) {
+  const text = String(err?.stderr ?? err?.message ?? err ?? "");
+  if (text.includes("rate limit")) {
+    return "GitHub's rate limit was reached. Wait for it to reset, or lower historySample in your config.";
+  }
+  if (text.includes("admin:org")) {
+    return "Runner capacity needs the admin:org scope: gh auth refresh -h github.com -s admin:org";
+  }
+  if (text.includes("Bad credentials") || text.includes("401")) {
+    return "GitHub rejected the credentials. Run gh auth login.";
+  }
+  return "Could not reach GitHub. Run `gh auth status` to check.";
+}
 
 const hhmm = (s) => {
   const t = Math.max(0, Math.floor(s));

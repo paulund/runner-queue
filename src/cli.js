@@ -138,3 +138,9 @@ main().catch((err) => {
   process.stderr.write(`${err?.message ?? err}\n`);
   process.exit(1);
 });
+
+// A GitHub failure (rate limit, revoked scope, offline) must not take the
+// server down. The UI reports a failed fetch and the next poll recovers.
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`runner-queue: ${err?.message ?? err}\n`);
+});

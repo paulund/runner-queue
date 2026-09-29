@@ -5,6 +5,7 @@
 import { listOrgRepos, listOrgRunners, collectQueue, collectHistory } from "./github.js";
 import { buildQueue, capacitySummary } from "./diagnose.js";
 import { findSuperseded, recommendFleet, runnerStats } from "./insights.js";
+import { cacheFile } from "./config.js";
 
 const mmss = (s) => {
   const t = Math.max(0, Math.round(s));
@@ -75,6 +76,7 @@ export async function cmdWait(config, { json = false } = {}) {
   const history = await collectHistory(repos, {
     days: config.historyDays,
     sample: config.historySample,
+    cachePath: cacheFile(config),
   });
 
   if (json) return JSON.stringify(history, null, 2);
@@ -109,6 +111,7 @@ export async function cmdFleet(config, { json = false } = {}) {
   const history = await collectHistory(repos, {
     days: config.historyDays,
     sample: config.historySample,
+    cachePath: cacheFile(config),
   });
   const capacity = capacitySummary(error ? null : runners);
   const rec = recommendFleet({ history, capacity, fleet: config.fleet });

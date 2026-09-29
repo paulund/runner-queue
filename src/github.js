@@ -134,7 +134,19 @@ export async function collectQueue(repos, { now = Date.now() } = {}) {
  * are therefore fanned out with bounded concurrency -- GitHub throttles you
  * otherwise, and a fully serial walk over ~300 runs took minutes.
  */
-export async function collectHistory(repos, { days = 30, sample = 40, concurrency = 8 } = {}) {
+export async function collectHistory(
+  repos,
+  { days = 30, sample = 40, concurrency = 8, cachePath } = {},
+) {
+  // Reading history is the most expensive thing this tool does, and the
+  // answer changes slowly, so a cached copy is served before spending any
+  // requests. This also keeps a repeatedly-opened dashboard from burning
+  // through the API rate limit.
+  if (cachePath) {
+    const cached = await readCache(cachePath, days);
+    if (cached) return cached;
+  }
+
   const cutoff = Date.now() - days * 86_400_000;
 
   const runLists = await mapLimit(repos, concurrency, async (repo) => {
@@ -189,7 +201,33 @@ export async function collectHistory(repos, { days = 30, sample = 40, concurrenc
     });
   }
 
-  return summarise(jobs, { days });
+  const summary = summarise(jobs, { days });
+  if (cachePath) await writeCache(cachePath, summary, { days });
+  return summary;
+}
+
+/** Cache reads and writes never break the caller. */
+async function readCache(path, days) {
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    if (raw.days !== days) return null;
+    if (Date.now() - raw.at > 6 * 60 * 60_000) return null;
+    return { ...raw.payload, cached: true };
+  } catch {
+    return null;
+  }
+}
+
+async function writeCache(path, payload, { days }) {
+  try {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify({ at: Date.now(), days, payload }));
+  } catch {
+    // A read-only working directory should not break the tool.
+  }
 }
 
 /** Runs `worker` over `items` with at most `limit` in flight. */
@@ -291,6 +329,9 @@ function timeToGreen(jobs) {
     const existing = byRun.get(key);
     if (existing) {
       existing.finishedAt = maxDate(existing.finishedAt, job.runUpdatedAt);
+      // A run starts when its first job reaches a runner, so the run's queue
+      // delay is the shortest job wait, not whichever job was seen first.
+      existing.waitS = Math.min(existing.waitS, job.waitS);
     } else {
       byRun.set(key, {
         createdAt: job.runCreatedAt,
@@ -312,6 +353,12 @@ function timeToGreen(jobs) {
       ? totals.reduce((n, r) => n + r.waitS, 0) /
         durations.reduce((n, d) => n + d, 0)
       : 0,
+    // Per-run execution times, excluding queue wait. The fleet estimate needs
+    // time actually spent on a runner; total duration would fold in the very
+    // delay being measured and inflate demand.
+    samples: totals.map((r, i) => ({
+      durationS: Math.max(0, durations[i] - r.waitS),
+    })),
   };
 }
 

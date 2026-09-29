@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 const DEFAULTS = {
   orgs: [],
@@ -119,6 +120,17 @@ export function filterRepos(repos, config) {
     if (only.size) return only.has(r.name) || only.has(r.full_name);
     return !ignore.has(r.name) && !ignore.has(r.full_name);
   });
+}
+
+/**
+ * Where the history cache lives. Kept out of the working directory by default
+ * so a checkout stays clean, and overridable for shared/CI use.
+ */
+export function cacheFile(config) {
+  const dir =
+    process.env.RUNNER_QUEUE_CACHE ??
+    join(homedir(), ".cache", "runner-queue");
+  return join(dir, `${config.orgs[0] ?? "org"}-${config.historyDays}d.json`);
 }
 
 export { DEFAULTS };

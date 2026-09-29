@@ -36,6 +36,21 @@ body {
   margin: 0 -28px 0;
 }
 
+/* ---- failure notice ---- */
+
+.offline {
+  background: var(--signal);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 9px 28px;
+  margin: 0 -28px;
+}
+
+.offline strong {
+  font-weight: 600;
+}
+
 /* ---- masthead ---- */
 
 .masthead {

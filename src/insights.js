@@ -8,6 +8,30 @@
  * (concurrency-hours needed per day) and compares it against what the current
  * fleet can supply in a day, then reports the gap.
  */
+/**
+ * The calendar days the sample actually spans, so a quiet stretch divides
+ * demand by the days that elapsed rather than only the days with runs.
+ */
+function spanDays(history) {
+  const daily = history.daily ?? [];
+  if (daily.length < 2) return daily.length || 1;
+  const first = Date.parse(daily[0].day);
+  const last = Date.parse(daily[daily.length - 1].day);
+  if (Number.isNaN(first) || Number.isNaN(last)) return daily.length;
+  return Math.max(1, Math.round((last - first) / 86_400_000) + 1);
+}
+
+/** Run execution times, in seconds, from the raw job samples. */
+function collectDurations(history) {
+  const runs = history.timeToGreen?.samples;
+  if (Array.isArray(runs) && runs.length) {
+    return runs
+      .map((r) => r.durationS)
+      .filter((d) => Number.isFinite(d) && d > 0);
+  }
+  return [];
+}
+
 export function recommendFleet({ history, capacity, fleet = {} }) {
   const idleCeiling = fleet.idleCeiling ?? 0.15;
   const target = fleet.targetUtilisation ?? 0.8;
@@ -19,13 +43,28 @@ export function recommendFleet({ history, capacity, fleet = {} }) {
     return { ok: false, reason: "no_runner_state", add: 0 };
   }
 
-  // Mean run duration per job, then jobs per day observed.
-  const meanJobS = history.overall.mean || 0;
-  const jobsPerDay = history.overall.n / Math.max(1, history.daily.length);
+  // Demand must be measured from how long jobs actually *run*, not from how
+  // long they waited. Wait time is the symptom of an overloaded queue; using
+  // it as the load would double-count: a queue that backs up inflates its own
+  // apparent demand.
+  //
+  // Run duration comes from run created_at to run updated_at. If the history
+  // sample carries no durations, fall back to wait time but say so, because
+  // that figure overstates load.
+  const durations = collectDurations(history);
+  const measuredOnDurations = durations.length > 0;
+  const meanJobS = measuredOnDurations
+    ? durations.reduce((a, b) => a + b, 0) / durations.length
+    : history.overall.mean || 0;
+
   if (!meanJobS) {
     return { ok: false, reason: "not_enough_history", add: 0 };
   }
 
+  // Jobs observed per calendar day. A day with no runs is still a day, so the
+  // window spans the whole sample range rather than only active days.
+  const dayCount = Math.max(1, spanDays(history));
+  const jobsPerDay = history.overall.n / dayCount;
   const demandHoursPerDay = (meanJobS * jobsPerDay) / 3600;
   const supplyHoursPerDay = capacity.total * 24 * target;
   const utilisation = supplyHoursPerDay

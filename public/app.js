@@ -124,7 +124,11 @@ function renderSuperseded() {
 function renderFleet(hist) {
   const el = $("fleet");
   const f = hist?.fleet;
-  if (!f || !f.ok) {
+  if (!f) {
+    el.innerHTML = `<p class="empty">Could not size the fleet without reading your recent runs.</p>`;
+    return;
+  }
+  if (!f.ok) {
     el.innerHTML = `<p class="empty">${
       f?.reason === "no_runner_state"
         ? "Sizing the fleet needs runner state. Run <code>gh auth refresh -h github.com -s admin:org</code>."
@@ -204,11 +208,19 @@ function startTicking() {
 
 async function poll() {
   try {
-    payload = await (await fetch("/api/queue")).json();
+    const res = await fetch("/api/queue");
+    if (!res.ok) {
+      const { error } = await res.json().catch(() => ({}));
+      throw new Error(error ?? `server returned ${res.status}`);
+    }
+    payload = await res.json();
     fetchedAt = Date.now();
+    $("offline").hidden = true;
     paint();
   } catch (err) {
-    $("foot-refresh").textContent = "could not reach the server";
+    $("offline").hidden = false;
+    $("offline-text").textContent = err.message;
+    $("foot-refresh").textContent = "not updating";
   }
 }
 
@@ -216,9 +228,21 @@ async function loadHistory() {
   const el = $("chart");
   let hist;
   try {
-    hist = await (await fetch("/api/history?days=30")).json();
-  } catch {
-    el.innerHTML = `<p class="empty">History is still loading. It reads completed runs, so the first pass takes a few seconds.</p>`;
+    const res = await fetch("/api/history?days=30");
+    if (!res.ok) {
+      const { error } = await res.json().catch(() => ({}));
+      throw new Error(error ?? `server returned ${res.status}`);
+    }
+    hist = await res.json();
+  } catch (err) {
+    el.innerHTML = `<p class="empty">${err.message}</p>`;
+    $("chart-legend").innerHTML = "";
+    renderFleet(null);
+    // The banner already carries this message once; repeating it in three
+    // panels turns one problem into three.
+    for (const id of ["fleet", "lint"]) {
+      $(id).innerHTML = `<p class="empty">Also unavailable while GitHub is unreachable.</p>`;
+    }
     return;
   }
 
@@ -253,10 +277,15 @@ async function loadHistory() {
 async function loadLint() {
   const el = $("lint");
   try {
-    const { findings } = await (await fetch("/api/lint")).json();
+    const res = await fetch("/api/lint");
+    if (!res.ok) {
+      const { error } = await res.json().catch(() => ({}));
+      throw new Error(error ?? `server returned ${res.status}`);
+    }
+    const { findings } = await res.json();
     renderLint(findings);
-  } catch {
-    el.innerHTML = `<p class="empty">Could not read workflows. They are fetched one file at a time, so this takes a moment.</p>`;
+  } catch (err) {
+    el.innerHTML = `<p class="empty">${err.message}</p>`;
   }
 }
 
