@@ -1,0 +1,23 @@
+{
+  "orgs": [],
+  "thresholdMinutes": 10,
+  "historyDays": 30,
+  "historySample": 40,
+  "onlyRepos": [],
+  "ignoreRepos": [],
+  "defaultBranch": "main",
+  "fleet": {
+    "idleCeiling": 0.15,
+    "targetUtilisation": 0.8
+  },
+  "alerts": {
+    "enabled": false,
+    "sustainedMinutes": 15,
+    "webhookUrl": null,
+    "cooldownMinutes": 60
+  },
+  "write": {
+    "allowCancel": false,
+    "allowRerun": false
+  }
+}

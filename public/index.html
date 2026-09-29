@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>runner queue</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="rule-top"></div>
+
+    <header class="masthead">
+      <div class="masthead-left">
+        <h1>runner queue</h1>
+        <p class="org" id="org">&mdash;</p>
+      </div>
+      <div class="masthead-right">
+        <dl class="tallies">
+          <div>
+            <dt>queued</dt>
+            <dd id="tally-queued">&mdash;</dd>
+          </div>
+          <div>
+            <dt>running</dt>
+            <dd id="tally-running">&mdash;</dd>
+          </div>
+          <div>
+            <dt>stuck</dt>
+            <dd id="tally-stuck" class="is-signal">&mdash;</dd>
+          </div>
+        </dl>
+      </div>
+    </header>
+
+    <section class="hero" id="hero" hidden>
+      <p class="hero-label">oldest waiting</p>
+      <div class="hero-clock" id="hero-clock" role="timer" aria-live="off">
+        00:00:00
+      </div>
+      <p class="hero-job" id="hero-job"></p>
+      <p class="hero-cause" id="hero-cause"></p>
+    </section>
+
+    <main>
+      <section class="panel" id="capacity-panel">
+        <h2>runners</h2>
+        <div id="capacity"></div>
+        <div id="superseded"></div>
+      </section>
+
+      <section class="panel wide">
+        <h2>queue</h2>
+        <div class="board" id="board"></div>
+      </section>
+
+      <section class="panel wide">
+        <h2>how long jobs waited</h2>
+        <p class="panel-sub">
+          Start time minus ready time, from completed runs. A rising line means
+          the queue is backing up.
+        </p>
+        <div id="chart"></div>
+        <div class="legend" id="chart-legend"></div>
+      </section>
+
+      <section class="panel wide">
+        <h2>does the fleet size hold up?</h2>
+        <div id="fleet"></div>
+      </section>
+
+      <section class="panel wide">
+        <h2>workflow problems</h2>
+        <p class="panel-sub">
+          Checked against the runner labels that actually exist. These are the
+          causes of a queue that never drains.
+        </p>
+        <div id="lint"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="foot-org"></span>
+      <span id="foot-refresh"></span>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

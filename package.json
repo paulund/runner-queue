@@ -1,0 +1,24 @@
+{
+  "name": "runner-queue",
+  "version": "0.1.0",
+  "private": true,
+  "description": "See what your GitHub self-hosted runner queue is doing, and why.",
+  "type": "module",
+  "bin": {
+    "runner-queue": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "dev": "node --watch src/cli.js",
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT"
+}
