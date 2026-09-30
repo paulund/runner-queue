@@ -1,21 +1,42 @@
+/**
+ * Everything that talks to GitHub.
+ *
+ * `gh api` is shelled out to rather than a token being read, so credentials
+ * stay in the user's keychain: this process never sees them, never logs them and
+ * never puts them anywhere a browser could reach.
+ */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { hostname } from "./errors.js";
 
 const run = promisify(execFile);
 
-/**
- * Calls `gh api` and parses JSON. Shelling out to the GitHub CLI means the
- * user's token stays in their keychain: we never see it, never log it, and
- * never put it in a browser.
- */
+const MAX_BUFFER = 64 * 1024 * 1024;
+
+/** Calls `gh api` and parses JSON. */
 export async function api(path, { method = "GET" } = {}) {
   const args = ["api", path];
   if (method !== "GET") args.push("-X", method);
-  const { stdout } = await run("gh", args, { maxBuffer: 64 * 1024 * 1024 });
+  const { stdout } = await run("gh", args, { maxBuffer: MAX_BUFFER });
   if (!stdout.trim()) return null;
   return JSON.parse(stdout);
 }
 
+/** Runs `worker` over `items` with at most `limit` in flight. */
+export async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const lanes = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
+
+/** One page of a paged collection, up to `pages` pages or the end. */
 async function paged(path, pages = 1) {
   const sep = path.includes("?") ? "&" : "?";
   const out = [];
@@ -28,27 +49,49 @@ async function paged(path, pages = 1) {
   return out;
 }
 
-export async function listOrgRepos(org) {
-  const repos = await api(
-    `/orgs/${org}/repos?per_page=100&type=all`,
-  );
-  return (repos ?? [])
-    .filter((r) => !r.archived)
-    .map((r) => ({ name: r.name, full_name: r.full_name, private: r.private }));
+/**
+ * Drops archived repositories unless they were asked for.
+ *
+ * Archived repositories never run their workflows, so they contribute nothing
+ * but noise and API calls. Split out from the API call so the rule can be
+ * tested without a network.
+ */
+export function visibleRepos(repos, { includeArchived = false } = {}) {
+  return (repos ?? []).filter((r) => includeArchived || !r.archived);
+}
+
+/**
+ * One organisation's repositories, each tagged with the org it came from.
+ */
+export async function listOrgRepos(org, { includeArchived = false } = {}) {
+  const repos = await api(`/orgs/${org}/repos?per_page=100&type=all`);
+  return visibleRepos(repos, { includeArchived }).map((r) => ({
+    org,
+    name: r.name,
+    full_name: r.full_name,
+    private: r.private,
+  }));
+}
+
+/** Repositories across every configured organisation. */
+export async function listOrgReposAll(orgs, options = {}) {
+  const perOrg = await mapLimit(orgs, 4, (org) => listOrgRepos(org, options));
+  return perOrg.flat();
 }
 
 /**
  * Org-level self-hosted runners. Requires an `admin:org` scoped token:
  *   gh auth refresh -h github.com -s admin:org
  * Returns `{ runners, error }` rather than throwing, because a missing scope
- * should degrade the UI to "queue visible, capacity unknown" instead of a
- * blank screen.
+ * should degrade the tool to "queue visible, capacity unknown" rather than
+ * failing outright.
  */
 export async function listOrgRunners(org) {
   try {
     const data = await api(`/orgs/${org}/actions/runners?per_page=100`);
     return {
       runners: (data?.runners ?? []).map((r) => ({
+        org,
         id: r.id,
         name: r.name,
         os: r.os,
@@ -69,7 +112,7 @@ export async function listOrgRunners(org) {
             kind: "missing_scope",
             message:
               "Runner capacity is hidden until your token has the admin:org scope.",
-            fix: "gh auth refresh -h github.com -s admin:org",
+            fix: `gh auth refresh -h ${hostname()} -s admin:org`,
           }
         : {
             kind: "forbidden",
@@ -81,30 +124,91 @@ export async function listOrgRunners(org) {
 }
 
 /**
+ * Runners across every configured organisation.
+ *
+ * Runners belong to one organisation, so a token missing `admin:org` for a
+ * single org leaves the others usable. `unknownOrgs` names the orgs whose
+ * capacity could not be read, which is what lets the diagnosis say "unknown"
+ * for those and still be specific for the rest; `runnerErrors` says why.
+ */
+export async function listOrgRunnersAll(orgs) {
+  const perOrg = await mapLimit(orgs, 4, async (org) => [org, await listOrgRunners(org)]);
+
+  const runners = [];
+  const unknownOrgs = new Set();
+  const runnerErrors = [];
+
+  for (const [org, result] of perOrg) {
+    if (result.error) {
+      unknownOrgs.add(org);
+      runnerErrors.push({ org, ...result.error });
+      continue;
+    }
+    runners.push(...result.runners);
+  }
+
+  return { runners, unknownOrgs, runnerErrors };
+}
+
+/**
+ * The jobs in a run that are still waiting for a runner.
+ *
+ * A run's own status is not enough to decide this. GitHub leaves a run marked
+ * `queued` while its jobs are already running, and leaves it that way until
+ * the last one finishes -- so taking the run at its word reports jobs that have
+ * been running for an hour, and jobs that finished twenty minutes ago, as
+ * "queued". The wait is then measured from creation to *now* instead of to the
+ * moment a runner picked the job up, so it is inflated as well.
+ *
+ * The job's own status is the only one that answers the question this tool
+ * asks: is anybody still waiting for this?
+ */
+export function waitingJobs(jobs) {
+  return (jobs ?? []).filter((job) => job.status === "queued");
+}
+
+/**
  * The queue. `status=queued` runs plus their jobs: each job carries the
  * `runs-on` labels it needs and the runner that eventually took it (empty
  * while waiting). Run-level `run_started_at` is useless here -- GitHub sets it
  * equal to `created_at` even for runs that never started -- so all timing
  * comes from job timestamps.
+ *
+ * Requests are bounded rather than issued all at once. A queue of 200 runs
+ * across 40 repos is 240 calls, and firing them together earns GitHub's
+ * secondary rate limits instead of an answer.
+ *
+ * A repository that cannot be read is reported rather than thrown: an org
+ * routinely contains a repository with Actions disabled, or one this token
+ * cannot see, and losing the whole queue report over one of them would be a
+ * poor trade.
+ *
+ * @param {Array<{ org: string, full_name: string }>} repos
+ * @param {{ concurrency?: number, runPages?: number }} [options]
  */
-export async function collectQueue(repos, { now = Date.now() } = {}) {
-  const perRepo = await Promise.all(
-    repos.map(async (repo) => {
+export async function collectQueue(repos, { concurrency = 8, runPages = 2 } = {}) {
+  return mapLimit(repos, concurrency, async (repo) => {
+    const empty = { org: repo.org, repo: repo.full_name, queued: [], inProgress: [], error: null };
+    try {
       const [queued, inProgress] = await Promise.all([
-        paged(`/repos/${repo.full_name}/actions/runs?status=queued`, 2),
+        paged(`/repos/${repo.full_name}/actions/runs?status=queued`, runPages),
         paged(`/repos/${repo.full_name}/actions/runs?status=in_progress`, 1),
       ]);
 
-      const jobLists = await Promise.all(
-        queued.map(async (run) => {
+      const jobLists = await mapLimit(queued, concurrency, async (run) => {
+        try {
           const jobs = await api(
             `/repos/${repo.full_name}/actions/runs/${run.id}/jobs?per_page=100`,
           );
-          return { run, jobs: jobs?.jobs ?? [] };
-        }),
-      );
+          return { run, jobs: waitingJobs(jobs?.jobs ?? []) };
+        } catch {
+          // A single unreadable run must not empty the whole queue view.
+          return { run, jobs: [] };
+        }
+      });
 
       return {
+        org: repo.org,
         repo: repo.full_name,
         queued: jobLists,
         inProgress: inProgress.map((run) => ({
@@ -117,12 +221,12 @@ export async function collectQueue(repos, { now = Date.now() } = {}) {
           startedAt: run.run_started_at,
           createdAt: run.created_at,
         })),
-        now,
+        error: null,
       };
-    }),
-  );
-
-  return perRepo;
+    } catch (err) {
+      return { ...empty, error: String(err?.message ?? err) };
+    }
+  });
 }
 
 /**
@@ -130,20 +234,25 @@ export async function collectQueue(repos, { now = Date.now() } = {}) {
  * actually started, wait = started_at - created_at. Those are the numbers
  * worth charting: p50/p90 per repo, per workflow, and per day.
  *
- * This is the expensive call: one request per run to read its jobs. Requests
- * are therefore fanned out with bounded concurrency -- GitHub throttles you
- * otherwise, and a fully serial walk over ~300 runs took minutes.
+ * This is the expensive call: one request per run to read its jobs. The answer
+ * changes slowly, so a cached copy is served before spending any requests, and
+ * the cache is only reused for the exact settings that produced it.
+ *
+ * @param {Array<{ org: string, full_name: string }>} repos
+ * @param {{
+ *   days?: number,
+ *   sample?: number,
+ *   concurrency?: number,
+ *   cachePath?: string,
+ *   cacheKey?: string,
+ * }} [options]
  */
 export async function collectHistory(
   repos,
-  { days = 30, sample = 40, concurrency = 8, cachePath } = {},
+  { days = 30, sample = 40, concurrency = 8, cachePath, cacheKey } = {},
 ) {
-  // Reading history is the most expensive thing this tool does, and the
-  // answer changes slowly, so a cached copy is served before spending any
-  // requests. This also keeps a repeatedly-opened dashboard from burning
-  // through the API rate limit.
   if (cachePath) {
-    const cached = await readCache(cachePath, days);
+    const cached = await readCache(cachePath, cacheKey);
     if (cached) return cached;
   }
 
@@ -182,10 +291,11 @@ export async function collectHistory(
     if (!job.started_at || !job.created_at) continue;
     const waitS = Math.max(
       0,
-      (new Date(job.started_at) - new Date(job.created_at)) / 1000,
+      (new Date(job.started_at).getTime() - new Date(job.created_at).getTime()) / 1000,
     );
     jobs.push({
       repo: repo.full_name,
+      org: repo.org,
       runId: run.id,
       runName: run.name,
       event: run.event,
@@ -202,16 +312,16 @@ export async function collectHistory(
   }
 
   const summary = summarise(jobs, { days });
-  if (cachePath) await writeCache(cachePath, summary, { days });
+  if (cachePath) await writeCache(cachePath, summary, cacheKey);
   return summary;
 }
 
 /** Cache reads and writes never break the caller. */
-async function readCache(path, days) {
+async function readCache(path, key) {
   try {
     const { readFile } = await import("node:fs/promises");
     const raw = JSON.parse(await readFile(path, "utf8"));
-    if (raw.days !== days) return null;
+    if (raw.key !== key) return null;
     if (Date.now() - raw.at > 6 * 60 * 60_000) return null;
     return { ...raw.payload, cached: true };
   } catch {
@@ -219,29 +329,15 @@ async function readCache(path, days) {
   }
 }
 
-async function writeCache(path, payload, { days }) {
+async function writeCache(path, payload, key) {
   try {
     const { mkdir, writeFile } = await import("node:fs/promises");
     const { dirname } = await import("node:path");
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify({ at: Date.now(), days, payload }));
+    await writeFile(path, JSON.stringify({ at: Date.now(), key, payload }));
   } catch {
-    // A read-only working directory should not break the tool.
+    // A read-only cache directory should not break the tool.
   }
-}
-
-/** Runs `worker` over `items` with at most `limit` in flight. */
-async function mapLimit(items, limit, worker) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await worker(items[index], index);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 function percentile(sorted, p) {
@@ -265,7 +361,7 @@ function stats(values) {
   };
 }
 
-/** Turns raw job samples into the aggregates the UI charts. */
+/** Turns raw job samples into the aggregates every report is built from. */
 export function summarise(jobs, { days = 30 } = {}) {
   const byRepo = new Map();
   const byWorkflow = new Map();
@@ -311,8 +407,8 @@ export function summarise(jobs, { days = 30 } = {}) {
     failures: jobs.filter((j) => j.conclusion === "failure").length,
     timeToGreen: timeToGreen(jobs),
     blockedHours: blockedHours(jobs, { days }),
-    // Raw samples, kept so the insights layer can compute per-runner stats
-    // without a second GitHub round trip.
+    // Raw samples, kept so the insights layer can compute per-runner stats and
+    // per-org figures without a second GitHub round trip.
     samples: jobs,
   };
 }
@@ -344,15 +440,16 @@ function timeToGreen(jobs) {
 
   const totals = [...byRun.values()].filter((r) => r.finishedAt && r.createdAt);
   const durations = totals.map(
-    (r) => (new Date(r.finishedAt) - new Date(r.createdAt)) / 1000,
+    (r) => (new Date(r.finishedAt).getTime() - new Date(r.createdAt).getTime()) / 1000,
   );
+  const waited = totals.reduce((n, r) => n + r.waitS, 0);
+  const elapsed = durations.reduce((n, d) => n + d, 0);
 
   return {
     ...stats(durations),
-    waitShare: durations.length
-      ? totals.reduce((n, r) => n + r.waitS, 0) /
-        durations.reduce((n, d) => n + d, 0)
-      : 0,
+    // Guarded on the total, not the count: a set of runs that each finished the
+    // instant they were created sums to zero, and 0/0 is NaN rather than 0.
+    waitShare: elapsed > 0 ? waited / elapsed : 0,
     // Per-run execution times, excluding queue wait. The fleet estimate needs
     // time actually spent on a runner; total duration would fold in the very
     // delay being measured and inflate demand.

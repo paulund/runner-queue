@@ -1,24 +1,48 @@
 {
   "name": "runner-queue",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.0.1",
   "description": "See what your GitHub self-hosted runner queue is doing, and why.",
+  "keywords": [
+    "github",
+    "actions",
+    "self-hosted-runners",
+    "ci",
+    "queue",
+    "cli"
+  ],
+  "license": "MIT",
   "type": "module",
   "bin": {
     "runner-queue": "./src/cli.js"
   },
-  "scripts": {
-    "start": "node src/cli.js",
-    "dev": "node --watch src/cli.js",
-    "test": "node --test test/*.test.js",
-    "typecheck": "tsc --noEmit"
-  },
+  "files": [
+    "src/",
+    "runner-queue.config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulund/runner-queue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/paulund/runner-queue/issues"
+  },
+  "homepage": "https://github.com/paulund/runner-queue#readme",
+  "author": "paulund",
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
     "typescript": "^5.7.2"
-  },
-  "license": "MIT"
+  }
 }

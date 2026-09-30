@@ -1,248 +1,286 @@
 /**
- * Text output for the same engine the UI uses. This is what an agent (or you,
- * in a terminal) calls: no browser, no polling, JSON-friendly with --json.
+ * The two commands: what is queued and why, and what the wait times look like.
+ *
+ * Each returns `{ out, code }` rather than writing to stdout itself, so that
+ * every command is testable and `--json` is a formatting decision instead of a
+ * second code path.
  */
-import { listOrgRepos, listOrgRunners, collectQueue, collectHistory } from "./github.js";
+import {
+  collectHistory,
+  collectQueue,
+  listOrgReposAll,
+  listOrgRunnersAll,
+} from "./github.js";
 import { buildQueue, capacitySummary } from "./diagnose.js";
-import { findSuperseded, recommendFleet, runnerStats } from "./insights.js";
-import { cacheFile } from "./config.js";
+import {
+  cacheFile,
+  filterRepos,
+  historyKey,
+} from "./config.js";
+import { EXIT } from "./errors.js";
+import { PLAIN, duration, pad, table } from "./format.js";
 
-const mmss = (s) => {
-  const t = Math.max(0, Math.round(s));
-  if (t < 60) return `${t}s`;
-  const m = Math.floor(t / 60);
-  if (m < 60) return `${m}m ${t % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
+/**
+ * How each cause is coloured: what is broken versus what is merely slow. A
+ * `scheduling` job is a runner about to pick something up, so it is not the
+ * same kind of news as a job nothing can ever run.
+ */
+const CAUSE_COLOUR = {
+  scheduling: "green",
+  all_busy: "yellow",
+  runner_offline: "yellow",
+  no_runners_online: "red",
+  label_mismatch: "red",
+  unknown_capacity: "dim",
 };
 
-export async function cmdWhy(config, { json = false } = {}) {
-  const repos = await listOrgRepos(config.orgs[0]);
-  const { runners, error } = await listOrgRunners(config.orgs[0]);
-  const perRepo = await collectQueue(repos);
-  const jobs = buildQueue(perRepo, error ? null : runners, {
-    thresholdS: config.thresholdMinutes * 60,
+const orList = (orgs) => orgs.join(", ");
+
+const orgWidth = (orgs) => Math.max(4, ...orgs.map((o) => String(o).length));
+
+const cause = (value, style) => style[CAUSE_COLOUR[value] ?? "dim"](value);
+
+/** The repositories in scope, after the org, archive and repo filters. */
+async function scopedRepos(config) {
+  const repos = await listOrgReposAll(config.orgs, {
+    includeArchived: config.includeArchived,
+  });
+  return filterRepos(repos, config);
+}
+
+/**
+ * The queue, fetched once.
+ *
+ * Repository listing and runner listing are independent, so they run together;
+ * the queue itself needs the repo list first.
+ */
+async function queueFor(config) {
+  const [repos, runnerData] = await Promise.all([
+    scopedRepos(config),
+    listOrgRunnersAll(config.orgs),
+  ]);
+
+  // One clock for the whole report. Taking the time separately for the fetch
+  // and again for the diagnosis can put a job over the threshold between the
+  // two, and the output would then disagree with itself.
+  const now = Date.now();
+
+  const perRepo = await collectQueue(repos, {
+    concurrency: config.concurrency,
+    runPages: config.queueRunPages,
   });
 
-  if (json) {
-    return JSON.stringify(
-      { jobs, runnerError: error, capacity: capacitySummary(error ? null : runners) },
-      null,
-      2,
+  const jobs = buildQueue(perRepo, runnerData.runners, {
+    now,
+    unknownOrgs: runnerData.unknownOrgs,
+  });
+
+  return {
+    repos,
+    perRepo,
+    jobs,
+    runners: runnerData.runners,
+    unknownOrgs: runnerData.unknownOrgs,
+    runnerErrors: runnerData.runnerErrors,
+    // Repositories that could not be read at all, so the report can name the
+    // gap in its coverage instead of quietly looking smaller.
+    unreadableRepos: perRepo.filter((r) => r.error).map((r) => r.repo),
+  };
+}
+
+async function historyFor(config, repos) {
+  return collectHistory(repos ?? (await scopedRepos(config)), {
+    days: config.historyDays,
+    sample: config.historySample,
+    concurrency: config.concurrency,
+    cachePath: cacheFile(config),
+    cacheKey: historyKey(config),
+  });
+}
+
+/** The runner block, so a queue with no free runner says so. */
+function capacityLines(orgs, runners, unknownOrgs, runnerErrors, style) {
+  const cap = capacitySummary(runners);
+  const names = [
+    ...(cap?.perOrg ?? []).map((p) => p.org),
+    ...[...unknownOrgs],
+  ];
+  const width = orgWidth(names.length ? names : [""]);
+
+  // No runners and no permission problem: the organisation genuinely has none.
+  if (!cap?.total && !runnerErrors.length) {
+    return [`${style.bold("Runners")}  none registered on ${orList(orgs)}`];
+  }
+
+  const lines = [style.bold("Runners")];
+  for (const per of cap?.perOrg ?? []) {
+    lines.push(
+      `  ${pad(per.org, width)}  ${per.idle} free, ${per.busy} busy, ${per.offline} offline (${per.total} total)`,
     );
+  }
+  for (const err of runnerErrors) {
+    lines.push(`  ${pad(err.org, width)}  ${err.message}`);
+    if (err.fix) lines.push(`  ${" ".repeat(width)}  ${style.cyan(`fix: ${err.fix}`)}`);
+  }
+  return lines;
+}
+
+// --- jobs -----------------------------------------------------------------
+
+/**
+ * @param deps the data sources, injectable so the presentation can be tested
+ *   without a network or a credential.
+ */
+export async function cmdJobs(config, opts = {}, deps = { queueFor }) {
+  const { json = false, style = PLAIN } = opts;
+  const { repos, perRepo, jobs, runners, unknownOrgs, runnerErrors, unreadableRepos } =
+    await deps.queueFor(config);
+
+  const thresholdS = config.thresholdMinutes * 60;
+  const stuck = jobs.filter((j) => j.waitS >= thresholdS);
+  const inProgressRuns = perRepo.reduce((n, r) => n + r.inProgress.length, 0);
+  const code = stuck.length ? EXIT.attention : EXIT.ok;
+
+  if (json) {
+    return {
+      out: JSON.stringify(
+        {
+          orgs: config.orgs,
+          generatedAt: new Date().toISOString(),
+          thresholdMinutes: config.thresholdMinutes,
+          summary: {
+            queuedJobs: jobs.length,
+            queuedRuns: perRepo.reduce((n, r) => n + r.queued.length, 0),
+            inProgressRuns,
+            stuckJobs: stuck.length,
+            reposInScope: repos.length,
+            reposWithQueuedJobs: new Set(jobs.map((j) => j.repo)).size,
+            oldestWaitS: jobs.length ? jobs[0].waitS : 0,
+          },
+          capacity: capacitySummary(runners),
+          unknownOrgs: [...unknownOrgs],
+          runnerErrors,
+          unreadableRepos,
+          jobs,
+        },
+        null,
+        2,
+      ),
+      code,
+    };
   }
 
   if (!jobs.length) {
-    return "The queue is empty. Nothing is waiting for a runner.";
+    return {
+      out: `The queue is empty. Nothing in ${orList(config.orgs)} is waiting for a runner.`,
+      code: EXIT.ok,
+    };
   }
-
-  const lines = [
-    `${jobs.length} job(s) queued across ${perRepo.length} repo(s).`,
-    "",
-  ];
 
   const worst = jobs[0];
-  lines.push(
-    `Worst: ${worst.repo} ${worst.branch} → ${worst.jobName}`,
-    `  waiting ${mmss(worst.waitS)}`,
-    `  cause: ${worst.cause}`,
-    `  ${worst.detail}`,
+  // Repositories holding queued work, not repositories in scope: "3 jobs across
+  // 40 repos" reads as though 40 repos have something waiting.
+  const busyRepos = new Set(jobs.map((j) => j.repo)).size;
+  const lines = [
+    `${style.bold(String(jobs.length))} job(s) queued across ${busyRepos} repo(s) in ${orList(config.orgs)}.`,
     "",
-  );
+    `${style.bold("Worst")}  ${worst.repo}  ${worst.branch} → ${worst.jobName}`,
+    `       waiting ${style.bold(duration(worst.waitS))}`,
+    `       cause   ${cause(worst.cause, style)}`,
+    `       ${worst.detail}`,
+  ];
 
-  const stuck = jobs.filter((j) => j.waitS >= config.thresholdMinutes * 60);
   if (stuck.length > 1) {
-    lines.push(`All jobs over ${config.thresholdMinutes}m:`);
-    for (const j of stuck) {
-      lines.push(
-        `  ${mmss(j.waitS).padStart(8)}  ${j.repo}/${j.branch} ${j.jobName} [${j.cause}]`,
-      );
+    lines.push("", style.bold(`All ${stuck.length} jobs over ${config.thresholdMinutes}m:`));
+    const rows = stuck.map((j) => [
+      pad(duration(j.waitS), 9),
+      `${j.repo}  ${j.branch}  ${j.jobName}`,
+      cause(j.cause, style),
+    ]);
+    for (const line of table(["waiting", "run", "cause"], rows)) {
+      lines.push(`  ${line}`);
     }
-    lines.push("");
   }
 
-  if (error) {
-    lines.push(`Runner capacity unknown: ${error.message}`);
-    if (error.fix) lines.push(`  fix: ${error.fix}`);
-  } else {
-    const cap = capacitySummary(runners);
-    lines.push(`Runners: ${cap.idle} free, ${cap.busy} busy, ${cap.offline} offline (${cap.total} total).`);
+  // Say what the table left out. A count of 11 above a list of 8, with no
+  // explanation, reads as eight jobs having gone missing.
+  const fresh = jobs.length - stuck.length;
+  if (fresh > 0) {
+    lines.push(
+      "",
+      style.dim(
+        `${fresh} job(s) also queued, all under the ${config.thresholdMinutes}m threshold.`,
+      ),
+    );
   }
 
-  return lines.join("\n");
+  lines.push("", ...capacityLines(config.orgs, runners, unknownOrgs, runnerErrors, style));
+
+  // Coverage gaps are reported, never hidden. A queue that looks short because
+  // one repository could not be read is worse than no answer at all.
+  if (unreadableRepos.length) {
+    lines.push(
+      "",
+      style.yellow(
+        `Not read: ${unreadableRepos.join(", ")} (${unreadableRepos.length} repo(s) could not be listed, so the queue above is incomplete)`,
+      ),
+    );
+  }
+
+  return { out: lines.join("\n"), code };
 }
 
-export async function cmdWait(config, { json = false } = {}) {
-  const repos = await listOrgRepos(config.orgs[0]);
-  const history = await collectHistory(repos, {
-    days: config.historyDays,
-    sample: config.historySample,
-    cachePath: cacheFile(config),
-  });
+// --- wait -----------------------------------------------------------------
 
-  if (json) return JSON.stringify(history, null, 2);
+export async function cmdWait(config, opts = {}, deps = { historyFor }) {
+  const { json = false, style = PLAIN } = opts;
+  const history = await deps.historyFor(config);
+
+  if (json) {
+    return {
+      out: JSON.stringify({ orgs: config.orgs, ...history }, null, 2),
+      code: EXIT.ok,
+    };
+  }
 
   const o = history.overall;
   const ttg = history.timeToGreen;
 
-  return [
-    `Wait times over the last ${history.daily.length} day(s) with completed runs, ${o.n} job samples.`,
-    "",
-    `  median wait   ${mmss(o.p50)}`,
-    `  p90 wait      ${mmss(o.p90)}   (n=${o.n})`,
-    `  worst wait    ${mmss(o.max)}`,
-    "",
-    `  median run    ${mmss(ttg.p50)} created to finished`,
-    `  queue share   ${(ttg.waitShare * 100).toFixed(0)}% of that is queue wait`,
-    "",
-    `  blocked CI    ${history.blockedHours.totalHours.toFixed(0)} job-hours across ${history.blockedHours.days} day(s)`,
-    "",
-    "Worst workflows:",
-    ...history.workflows.slice(0, 6).map(
-      (w) =>
-        `  ${mmss(w.p90).padStart(8)} p90  n=${String(w.n).padStart(3)}  ${w.repo} ${w.workflow}`,
-    ),
-  ].join("\n");
-}
-
-export async function cmdFleet(config, { json = false } = {}) {
-  const org = config.orgs[0];
-  const repos = await listOrgRepos(org);
-  const { runners, error } = await listOrgRunners(org);
-  const history = await collectHistory(repos, {
-    days: config.historyDays,
-    sample: config.historySample,
-    cachePath: cacheFile(config),
-  });
-  const capacity = capacitySummary(error ? null : runners);
-  const rec = recommendFleet({ history, capacity, fleet: config.fleet });
-
-  if (json) return JSON.stringify({ rec, capacity }, null, 2);
-  if (!rec.ok) {
-    return `Cannot size the fleet: ${rec.reason.replace(/_/g, " ")}.`;
+  if (!o.n) {
+    return {
+      out: [
+        `No completed runs with started jobs in the last ${config.historyDays} day(s).`,
+        "",
+        "Nothing to measure yet. Check the org and repo filters, or widen the window with",
+        "--history-days.",
+      ].join("\n"),
+      code: EXIT.ok,
+    };
   }
 
-  const lines = [
-    `Demand   ${rec.demandHoursPerDay.toFixed(1)} runner-hours per day`,
-    `Supply   ${rec.supplyHoursPerDay.toFixed(0)} runner-hours per day (${capacity.total} runners)`,
-    `Use      ${(rec.utilisation * 100).toFixed(0)}% at target ${(config.fleet.targetUtilisation * 100).toFixed(0)}%`,
-    `Idle     ${(rec.idleShare * 100).toFixed(0)}% of runners currently free`,
-    `Blocked  ${rec.blockedHoursPerDay.toFixed(0)} job-hours per day waiting`,
-    "",
-  ];
-
-  if (rec.reason) {
-    lines.push(rec.reason);
-  } else if (rec.verdict === "saturated") {
-    lines.push(`Verdict: add ${rec.add} runner(s).`);
-  } else if (rec.verdict === "tight") {
-    lines.push("Verdict: close to saturation. Watch it; no change needed yet.");
-  } else {
-    lines.push("Verdict: healthy. Adding runners would waste money.");
-  }
-
-  return lines.join("\n");
-}
-
-export async function cmdSuperseded(config, { json = false } = {}) {
-  const org = config.orgs[0];
-  const repos = await listOrgRepos(org);
-  const { runners, error } = await listOrgRunners(org);
-  const perRepo = await collectQueue(repos);
-  const jobs = buildQueue(perRepo, error ? null : runners, {
-    thresholdS: config.thresholdMinutes * 60,
-  });
-  const superseded = findSuperseded(jobs);
-
-  if (json) return JSON.stringify(superseded, null, 2);
-  if (!superseded.length) {
-    return "No queued runs have been superseded by a newer run on the same branch.";
-  }
-
-  return [
-    `${superseded.length} queued run(s) are superseded by newer runs on the same branch:`,
-    "",
-    ...superseded.map(
-      (j) =>
-        `  ${mmss(j.waitS).padStart(8)}  ${j.repo} ${j.branch} (run ${j.runNumber}) superseded by run ${j.supersededBy.runId}`,
-    ),
-    "",
-    "Run `runner-queue cancel <run-id>` to clear one.",
-  ].join("\n");
-}
-
-export async function cmdRunners(config, { json = false } = {}) {
-  const org = config.orgs[0];
-  const { runners, error } = await listOrgRunners(org);
-  if (error) {
-    return json
-      ? JSON.stringify({ error }, null, 2)
-      : `${error.message}\n  fix: ${error.fix ?? "check your token scopes"}`;
-  }
-  if (json) return JSON.stringify(runners, null, 2);
-
-  if (!runners.length) return "No self-hosted runners registered on this organisation.";
-
-  return runners
-    .map((r) => {
-      const state = r.status !== "online" ? "offline" : r.busy ? "busy" : "free";
-      return `${state.padEnd(8)} ${r.name.padEnd(18)} ${r.labels.join(", ")}`;
-    })
-    .join("\n");
-}
-
-export async function cmdCancel(config, runId) {
-  const org = config.orgs[0];
-  if (!config.write.allowCancel) {
-    return [
-      "Refusing to cancel: write actions are disabled.",
+  return {
+    out: [
+      `Wait times over the last ${history.daily.length} day(s) with completed runs, ${o.n} job samples from ${history.byRepo.length} repo(s).${history.cached ? "  (cached)" : ""}`,
       "",
-      "To enable, set write.allowCancel to true in runner-queue.config.json:",
-      '  { "write": { "allowCancel": true } }',
+      `  median wait   ${duration(o.p50)}`,
+      `  p90 wait      ${duration(o.p90)}   ${style.dim(`(n=${o.n})`)}`,
+      `  worst wait    ${duration(o.max)}`,
       "",
-      "Cancelling a queued run is safe -- nothing has run yet -- but it is a",
-      "change to someone else's CI, so it has to be opt-in.",
-    ].join("\n");
-  }
-
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const run = promisify(execFile);
-
-  // Accept a bare run id and find which repo it belongs to.
-  const repos = await listOrgRepos(org);
-  for (const repo of repos) {
-    try {
-      const { stdout } = await run("gh", [
-        "api",
-        `/repos/${repo.full_name}/actions/runs/${runId}`,
-      ]);
-      const parsed = JSON.parse(stdout);
-      if (!parsed.id) continue;
-
-      // Second guard against the dependabot trap: a `dynamic` run reports the
-      // base branch, so "superseded" reasoning must never reach one.
-      if (parsed.event === "dynamic") {
-        return [
-          `Refusing to cancel run ${runId} in ${repo.full_name}.`,
-          "",
-          `It was triggered by "${parsed.event}" (usually Dependabot). These runs`,
-          "all report the base branch as their head branch, so they look like",
-          "superseded runs when they are actually separate dependency updates.",
-          "",
-          `Cancel it directly if you are sure: https://github.com/${repo.full_name}/actions/runs/${runId}`,
-        ].join("\n");
-      }
-
-      await run("gh", [
-        "api",
-        `/repos/${repo.full_name}/actions/runs/${runId}/cancel`,
-        "-X",
-        "POST",
-      ]);
-      return `Cancelled run ${runId} in ${repo.full_name}.`;
-    } catch {
-      // Not in this repo, or not cancellable; keep looking.
-    }
-  }
-  return `Could not find run ${runId} in ${org}.`;
+      `  median run    ${duration(ttg.p50)} created to finished`,
+      `  queue share   ${(ttg.waitShare * 100).toFixed(0)}% of that is queue wait`,
+      "",
+      `  blocked CI    ${history.blockedHours.totalHours.toFixed(0)} job-hours across ${history.blockedHours.days} day(s)`,
+      "",
+      style.bold("Worst workflows:"),
+      ...history.workflows
+        .slice(0, 6)
+        .map((w) => `  ${pad(duration(w.p90), 9)} p90  n=${pad(w.n, 4)}  ${w.repo} ${w.workflow}`),
+    ].join("\n"),
+    code: EXIT.ok,
+  };
 }
+
+export const COMMANDS = {
+  jobs: { summary: "what is queued, and why it is stuck", run: cmdJobs },
+  wait: { summary: "wait-time analytics from recent runs", run: cmdWait },
+};

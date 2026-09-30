@@ -1,6 +1,10 @@
 node_modules/
-.DS_Store
+
+# Your own settings. The example file next to it is committed; this is not.
 runner-queue.config.json
+
 *.log
+*.tgz
+.DS_Store
+.env
 .cache/
-.playwright-cli/
