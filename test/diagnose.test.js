@@ -7,6 +7,7 @@ import {
   matchesLabels,
   runnersForOrg,
 } from "../src/diagnose.js";
+import { hostIndex } from "../src/hosts.js";
 
 const runner = (over = {}) => ({
   id: 1,
@@ -105,6 +106,112 @@ test("a job whose only matching runners are offline says so, however many other 
   assert.equal(d.cause, "runner_offline");
   assert.match(d.detail, /mac-1, mac-2/);
   assert.doesNotMatch(d.detail, /linux-1/);
+});
+
+// --- disk pressure --------------------------------------------------------
+
+const AT = "2026-01-01T00:20:00Z";
+const NOW = Date.parse(AT);
+const JOB = { labels: ["self-hosted"], created_at: "2026-01-01T00:00:00Z" };
+
+const hosts = (reports, thresholds = {}) =>
+  hostIndex(reports, { minFreePercent: 5, maxAgeMinutes: 30, ...thresholds });
+
+const tight = (name = "r1") => ({
+  runner: name,
+  at: AT,
+  disk: { totalBytes: 500e9, freeBytes: 5e9, freePercent: 1 },
+});
+
+const roomy = (name = "r1") => ({
+  runner: name,
+  at: AT,
+  disk: { totalBytes: 500e9, freeBytes: 400e9, freePercent: 80 },
+});
+
+test("a free runner on a full disk is a disk problem, not scheduling", () => {
+  // The case that motivates the feature: the Actions tab says a runner is free
+  // and idle, the job is not picking it up, and nothing in the API explains why.
+  const d = diagnoseJob(JOB, [runner()], { now: NOW, hosts: hosts([tight("r1")]) });
+  assert.equal(d.cause, "host_disk_pressure");
+  assert.match(d.detail, /r1/);
+  assert.match(d.detail, /1% free/);
+});
+
+test("all-busy runners that are all out of disk are a disk problem too", () => {
+  const d = diagnoseJob(JOB, [runner({ busy: true })], { now: NOW, hosts: hosts([tight("r1")]) });
+  assert.equal(d.cause, "host_disk_pressure");
+});
+
+test("one healthy host is enough to keep the ordinary cause", () => {
+  // Only *every* eligible runner being tight is a disk problem. If one machine
+  // has room, the job has somewhere to go and the answer is capacity.
+  const d = diagnoseJob(JOB, [runner({ id: 1, name: "r1" }), runner({ id: 2, name: "r2" })], {
+    now: NOW,
+    hosts: hosts([tight("r1"), roomy("r2")]),
+  });
+  assert.equal(d.cause, "scheduling");
+});
+
+test("a runner nobody reported on is not counted as healthy", () => {
+  // Without this, adding host reports for one machine would start explaining
+  // queues for every other machine in the org.
+  const d = diagnoseJob(JOB, [runner({ id: 1, name: "r1" }), runner({ id: 2, name: "r2" })], {
+    now: NOW,
+    hosts: hosts([tight("r1")]),
+  });
+  assert.equal(d.cause, "scheduling");
+  assert.doesNotMatch(d.detail, /disk/);
+});
+
+test("a stale disk report does not change the cause", () => {
+  // A report an hour old saying the disk was fine is worse than no report: it
+  // would confidently explain a queue with the wrong cause.
+  const stale = { ...tight("r1"), at: "2025-12-31T22:20:00Z" };
+  const d = diagnoseJob(JOB, [runner()], {
+    now: NOW,
+    hosts: hosts([stale], { maxAgeMinutes: 30 }),
+  });
+  assert.equal(d.cause, "scheduling");
+});
+
+test("no host reports at all leaves the diagnosis exactly as it was", () => {
+  const bare = diagnoseJob(JOB, [runner()], { now: NOW });
+  const withHosts = diagnoseJob(JOB, [runner()], { now: NOW, hosts: hosts([roomy("r1")]) });
+  assert.equal(bare.cause, "scheduling");
+  assert.equal(withHosts.cause, bare.cause);
+  assert.equal(withHosts.detail, bare.detail);
+});
+
+test("an offline runner is never blamed on disk", () => {
+  // A switched-off machine is the fixable thing; a disk is not what is wrong
+  // with it, and the runner-offline cause has its own advice.
+  const d = diagnoseJob(JOB, [runner({ status: "offline" })], {
+    now: NOW,
+    hosts: hosts([tight("r1")]),
+  });
+  assert.equal(d.cause, "no_runners_online");
+});
+
+test("disk pressure reaches a job through buildQueue", () => {
+  const perRepo = [
+    {
+      org: "acme",
+      repo: "api",
+      queued: [
+        {
+          run: { id: 1, name: "ci", run_number: 2, event: "push", head_branch: "main", html_url: "u" },
+          jobs: [queuedJob()],
+        },
+      ],
+      inProgress: [],
+    },
+  ];
+  const jobs = buildQueue(perRepo, [{ ...runner(), org: "acme" }], {
+    now: NOW,
+    hosts: hosts([tight("r1")]),
+  });
+  assert.equal(jobs[0].cause, "host_disk_pressure");
 });
 
 test("diagnoseJob never guesses a cause when runner state is unknown", () => {

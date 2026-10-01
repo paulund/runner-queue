@@ -4,7 +4,14 @@ import { mkdir, mkdtemp, readFile, symlink, utimes, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  diskPressure,
   diskUsage,
+  freePercentFor,
+  hostIndex,
+  hostReportFor,
+  isFresh,
+  pressureFor,
+  readHostReports,
   removeCheckout,
   scanWorkDir,
   staleCheckouts,
@@ -19,6 +26,104 @@ import {
 const tmp = () => mkdtemp(join(tmpdir(), "rq-hosts-"));
 
 const hoursAgo = (h, now) => now - h * 3_600_000;
+
+const report = (over = {}) => ({
+  runner: "runner-01",
+  at: new Date().toISOString(),
+  disk: { totalBytes: 500e9, freeBytes: 250e9, freePercent: 50 },
+  ...over,
+});
+
+// --- reading reports ------------------------------------------------------
+
+test("a report is read from the directory and named after its file", async () => {
+  const dir = await tmp();
+  // No `runner` field: the file name is the identity, which is how a host that
+  // only knows its own hostname still produces something `jobs` can use.
+  await writeFile(
+    join(dir, "runner-03.json"),
+    JSON.stringify({ at: new Date().toISOString() }),
+  );
+
+  const { reports, errors } = await readHostReports(dir);
+  assert.equal(errors.length, 0);
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].runner, "runner-03");
+});
+
+test("a missing report directory is a gap, not a failure", async () => {
+  const { reports, errors } = await readHostReports("/nonexistent/host-reports");
+  assert.deepEqual(reports, []);
+  assert.equal(errors.length, 1);
+  // The wording matters: this has to read as "we could not check", not "all clear".
+  assert.match(errors[0].message, /could not read host report directory/);
+});
+
+test("an unparseable report is reported and the others still load", async () => {
+  const dir = await tmp();
+  await writeFile(join(dir, "runner-01.json"), JSON.stringify(report()));
+  await writeFile(join(dir, "runner-02.json"), "{ not json");
+
+  const { reports, errors } = await readHostReports(dir);
+  assert.deepEqual(reports.map((r) => r.runner), ["runner-01"]);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].file, "runner-02.json");
+});
+
+test("no directory configured means no reports and no error", async () => {
+  const { reports, errors } = await readHostReports(null);
+  assert.deepEqual(reports, []);
+  assert.deepEqual(errors, []);
+});
+
+// --- pressure -------------------------------------------------------------
+
+test("a host under the free-space threshold counts as tight", () => {
+  const hosts = hostIndex([report({ disk: { freePercent: 2 } })], { minFreePercent: 5 });
+  assert.equal(pressureFor({ name: "runner-01" }, hosts), true);
+});
+
+test("a host with room counts as not tight", () => {
+  const hosts = hostIndex([report({ disk: { freePercent: 40 } })], { minFreePercent: 5 });
+  assert.equal(pressureFor({ name: "runner-01" }, hosts), false);
+});
+
+test("a runner nobody reported on is unknown, not healthy", () => {
+  // The distinction the whole design turns on: `null` is not `false`.
+  const hosts = hostIndex([report()], { minFreePercent: 5 });
+  assert.equal(pressureFor({ name: "runner-99" }, hosts), null);
+});
+
+test("a stale report is ignored rather than trusted", () => {
+  const now = Date.now();
+  const stale = report({
+    at: new Date(hoursAgo(2, now)).toISOString(),
+    disk: { freePercent: 1 },
+  });
+  const hosts = hostIndex([stale], { minFreePercent: 5, maxAgeMinutes: 30 });
+  assert.equal(pressureFor({ name: "runner-01" }, hosts, { now }), null);
+});
+
+test("a report from the future is ignored", () => {
+  const now = Date.now();
+  const ahead = report({
+    at: new Date(now + 60 * 60_000).toISOString(),
+    disk: { freePercent: 1 },
+  });
+  assert.equal(isFresh(ahead, 30, now), false);
+});
+
+test("a report with no figures makes no claim", () => {
+  assert.equal(diskPressure({ disk: {} }, 5), false);
+  assert.equal(diskPressure({}, 5), false);
+  assert.equal(freePercentFor({ name: "runner-01" }, hostIndex([report({ disk: null })])), null);
+});
+
+test("reports are looked up by runner name", () => {
+  const hosts = hostIndex([report(), report({ runner: "runner-02" })]);
+  assert.equal(hostReportFor(hosts, "runner-02").runner, "runner-02");
+  assert.equal(hostReportFor(hosts, "runner-99"), null);
+});
 
 /** Builds a `_work` tree with the given `<owner>/<repo>/<ref>` checkouts. */
 async function workTree(spec) {

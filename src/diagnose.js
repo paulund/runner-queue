@@ -6,8 +6,20 @@
  * say "unknown" instead of guessing a cause we cannot verify. Whether a job is
  * "stuck" is a separate question, answered by the caller comparing `waitS`
  * against its own threshold, so no threshold is decided here.
+ *
+ * `hosts` is the same bargain one level further down: a map of runner name to
+ * that host's latest disk report, or nothing at all. A missing report never
+ * turns into a claim in either direction.
  */
-export function diagnoseJob(job, runners, { now = Date.now() } = {}) {
+import { freePercentFor, pressureFor } from "./hosts.js";
+export function diagnoseJob(
+  job,
+  runners,
+  {
+    now = Date.now(),
+    hosts = /** @type {import("./hosts.js").HostIndex | null} */ (null),
+  } = {},
+) {
   const waitS = Math.max(
     0,
     (now - new Date(job.created_at).getTime()) / 1000,
@@ -34,6 +46,19 @@ export function diagnoseJob(job, runners, { now = Date.now() } = {}) {
   const eligibleIdle = eligibleOnline.filter((r) => !r.busy);
 
   if (eligibleIdle.length > 0) {
+    // A runner on a full disk reports itself idle and never picks the job up,
+    // so "a free runner exists" is not by itself an answer. It is an answer when
+    // at least one of those runners has disk to spare.
+    const pressure = hostPressure(eligibleIdle, hosts, { now });
+    if (pressure) {
+      return {
+        waitS,
+        cause: "host_disk_pressure",
+        detail:
+          `Every free runner for this job (${names(eligibleIdle)}) is on a host ` +
+          `reported out of disk (${pressure}). It will not be able to check out.`,
+      };
+    }
     return {
       waitS,
       cause: "scheduling",
@@ -45,12 +70,20 @@ export function diagnoseJob(job, runners, { now = Date.now() } = {}) {
   }
 
   if (eligibleOnline.length > 0) {
+    const pressure = hostPressure(eligibleOnline, hosts, { now });
+    if (pressure) {
+      return {
+        waitS,
+        cause: "host_disk_pressure",
+        detail:
+          `Every online runner for this job (${names(eligibleOnline)}) is on a host ` +
+          `reported out of disk (${pressure}). They cannot take a checkout.`,
+      };
+    }
     return {
       waitS,
       cause: "all_busy",
-      detail: `Every online runner labelled for this job is busy: ${eligibleOnline
-        .map((r) => r.name)
-        .join(", ")}.`,
+      detail: `Every online runner labelled for this job is busy: ${names(eligibleOnline)}.`,
     };
   }
 
@@ -78,9 +111,7 @@ export function diagnoseJob(job, runners, { now = Date.now() } = {}) {
     return {
       waitS,
       cause: "runner_offline",
-      detail: `The only runners labelled for this job (${offline
-        .map((r) => r.name)
-        .join(", ")}) are offline.`,
+      detail: `The only runners labelled for this job (${names(offline)}) are offline.`,
     };
   }
 
@@ -89,11 +120,29 @@ export function diagnoseJob(job, runners, { now = Date.now() } = {}) {
     cause: "label_mismatch",
     detail:
       `No runner is labelled ${needs.map((l) => `"${l}"`).join(" and ")}. ` +
-      `Online runners carry: ${online
-        .flatMap((r) => r.labels)
-        .filter((v, i, a) => a.indexOf(v) === i)
-        .join(", ") || "none"}.`,
+      `Online runners carry: ${[...new Set(online.flatMap((r) => r.labels))].join(", ") || "none"}.`,
   };
+}
+
+const names = (runners) => runners.map((r) => r.name).join(", ");
+
+const round = (n) => Math.round(n);
+
+/**
+ * Names the disk state shared by a set of runners, or returns `null` if the set
+ * cannot be called uniformly tight.
+ *
+ * Two conditions have to hold. Every runner in the set has to be *reported* as
+ * low, and there has to be at least one report -- otherwise a single
+ * uninstrumented machine in the set would be reported as though we had checked
+ * it. `pressureFor` is tri-state precisely so that "no report" and "reported
+ * healthy" cannot be collapsed into one another.
+ */
+function hostPressure(runners, hosts, { now }) {
+  if (!hosts || !runners.length) return null;
+  if (!runners.every((r) => pressureFor(r, hosts, { now }) === true)) return null;
+  const free = round(freePercentFor(runners[0], hosts) ?? 0);
+  return runners.length === 1 ? `${free}% free` : `${free}% free on each host`;
 }
 
 /**
@@ -118,7 +167,14 @@ export function matchesLabels(runner, needs) {
 export function buildQueue(
   perRepo,
   runners,
-  { now = Date.now(), unknownOrgs = new Set() } = {},
+  {
+    now = Date.now(),
+    unknownOrgs = new Set(),
+    // `buildQueue` is the boundary between the two halves of the tool, and is
+    // where a null has to be allowed through: no host reports is the normal case
+    // for anyone who has not instrumented their runners.
+    hosts = /** @type {import("./hosts.js").HostIndex | null} */ (null),
+  } = {},
 ) {
   const jobs = [];
 
@@ -129,7 +185,7 @@ export function buildQueue(
 
     for (const { run, jobs: runJobs } of repo.queued) {
       for (const job of runJobs) {
-        const diag = diagnoseJob(job, repoRunners, { now });
+        const diag = diagnoseJob(job, repoRunners, { now, hosts });
         jobs.push({
           org: repo.org,
           repo: repo.repo,

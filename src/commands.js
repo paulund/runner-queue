@@ -24,11 +24,16 @@ import {
 } from "./config.js";
 import {
   diskUsage,
+  hostIndex,
+  isFresh,
   pruneWorktrees,
+  readHostReports,
   removeCheckout,
   scanWorkDir,
   staleCheckouts,
 } from "./hosts.js";
+
+const round = (n) => Math.round(Number(n) || 0);
 import { EXIT } from "./errors.js";
 import { PLAIN, duration, pad, table } from "./format.js";
 
@@ -43,6 +48,9 @@ const CAUSE_COLOUR = {
   runner_offline: "yellow",
   no_runners_online: "red",
   label_mismatch: "red",
+  // Red, and not yellow: the machine is up and has room in the queue, so
+  // nothing in the Actions tab looks wrong until you go and look at the disk.
+  host_disk_pressure: "red",
   unknown_capacity: "dim",
 };
 
@@ -61,15 +69,40 @@ async function scopedRepos(config) {
 }
 
 /**
+ * Reads the host reports for this run, or returns `null` when none are wanted.
+ *
+ * The whole lookup is optional and its failure is not fatal, because host
+ * reports are an enrichment rather than a dependency: `jobs` must still answer
+ * for an org where nobody has instrumented the runners. The errors are carried
+ * through so the report can name the gap in its coverage instead of quietly
+ * diagnosing with fewer machines than it looks.
+ *
+ * @returns {Promise<{ hosts: import("./hosts.js").HostIndex | null,
+ *   errors: { file: string, message: string }[] }>}
+ */
+async function hostReportsFor(config) {
+  if (!config.hostReportDir) return { hosts: null, errors: [] };
+  const { reports, errors } = await readHostReports(config.hostReportDir);
+  return {
+    hosts: hostIndex(reports, {
+      minFreePercent: config.hostDiskFreePercent,
+      maxAgeMinutes: config.hostReportMaxAgeMinutes,
+    }),
+    errors,
+  };
+}
+
+/**
  * The queue, fetched once.
  *
  * Repository listing and runner listing are independent, so they run together;
  * the queue itself needs the repo list first.
  */
 async function queueFor(config) {
-  const [repos, runnerData] = await Promise.all([
+  const [repos, runnerData, hostData] = await Promise.all([
     scopedRepos(config),
     listOrgRunnersAll(config.orgs),
+    hostReportsFor(config),
   ]);
 
   // One clock for the whole report. Taking the time separately for the fetch
@@ -85,6 +118,7 @@ async function queueFor(config) {
   const jobs = buildQueue(perRepo, runnerData.runners, {
     now,
     unknownOrgs: runnerData.unknownOrgs,
+    hosts: hostData.hosts,
   });
 
   return {
@@ -94,6 +128,8 @@ async function queueFor(config) {
     runners: runnerData.runners,
     unknownOrgs: runnerData.unknownOrgs,
     runnerErrors: runnerData.runnerErrors,
+    hosts: hostData.hosts,
+    hostErrors: hostData.errors,
     // Repositories that could not be read at all, so the report can name the
     // gap in its coverage instead of quietly looking smaller.
     unreadableRepos: perRepo.filter((r) => r.error).map((r) => r.repo),
@@ -108,6 +144,46 @@ async function historyFor(config, repos) {
     cachePath: cacheFile(config),
     cacheKey: historyKey(config),
   });
+}
+
+/**
+ * The host block: which runners have told us how much room they have left.
+ *
+ * Deliberately shows every reporting host, not only the tight ones. A host that
+ * is 60% free is the evidence that the ones below the threshold are genuinely
+ * in trouble, and a list containing only the failures would read as though
+ * every other machine had been checked too.
+ */
+function hostLines(hosts, style, { maxAgeMinutes, now = Date.now() }) {
+  if (!hosts) return [];
+  const { reports, minFreePercent } = hosts;
+  if (!reports.length) {
+    return [
+      style.dim(
+        `Hosts  no reports in the host report directory. Jobs that look schedulable are not being checked against disk.`,
+      ),
+    ];
+  }
+
+  const width = Math.max(4, ...reports.map((r) => String(r.runner).length));
+  const lines = [style.bold("Hosts")];
+
+  for (const report of reports) {
+    const free = report.disk?.freePercent;
+    const known = typeof free === "number" && Number.isFinite(free);
+    const fresh = isFresh(report, maxAgeMinutes, now);
+    const label = known ? `${round(free)}% free` : "disk unknown";
+    const text = `${pad(report.runner, width)}  ${pad(label, 12)}`;
+
+    if (!fresh) {
+      lines.push(`  ${style.dim(text)}  ${style.dim("(report too old to trust)")}`);
+    } else if (known && free < minFreePercent) {
+      lines.push(`  ${style.red(text)}  ${style.red(`under ${minFreePercent}%`)}`);
+    } else {
+      lines.push(`  ${text}`);
+    }
+  }
+  return lines;
 }
 
 /** The runner block, so a queue with no free runner says so. */
@@ -144,9 +220,21 @@ function capacityLines(orgs, runners, unknownOrgs, runnerErrors, style) {
  *   without a network or a credential.
  */
 export async function cmdJobs(config, opts = {}, deps = { queueFor }) {
-  const { json = false, style = PLAIN } = opts;
-  const { repos, perRepo, jobs, runners, unknownOrgs, runnerErrors, unreadableRepos } =
-    await deps.queueFor(config);
+  // `now` is the same clock `queueFor` diagnosed with. Taken again here, the
+  // host block and the causes above it could disagree about what counts as
+  // stale, which is the one thing these two sections exist to agree on.
+  const { json = false, style = PLAIN, now = Date.now() } = opts;
+  const {
+    repos,
+    perRepo,
+    jobs,
+    runners,
+    unknownOrgs,
+    runnerErrors,
+    unreadableRepos,
+    hosts = null,
+    hostErrors = [],
+  } = await deps.queueFor(config);
 
   const thresholdS = config.thresholdMinutes * 60;
   const stuck = jobs.filter((j) => j.waitS >= thresholdS);
@@ -173,6 +261,18 @@ export async function cmdJobs(config, opts = {}, deps = { queueFor }) {
           unknownOrgs: [...unknownOrgs],
           runnerErrors,
           unreadableRepos,
+          // Added, never renamed, and always present: a `hosts` key that appears
+          // only when reports happen to exist makes `--json` output change shape
+          // between runs, and callers have to handle both. `null` is the honest
+          // value for "not looked at".
+          hosts: hosts
+            ? {
+                minFreePercent: hosts.minFreePercent,
+                maxAgeMinutes: hosts.maxAgeMinutes,
+                reports: hosts.reports,
+              }
+            : null,
+          hostErrors,
           jobs,
         },
         null,
@@ -228,6 +328,12 @@ export async function cmdJobs(config, opts = {}, deps = { queueFor }) {
 
   lines.push("", ...capacityLines(config.orgs, runners, unknownOrgs, runnerErrors, style));
 
+  const hostBlock = hostLines(hosts, style, {
+    maxAgeMinutes: config.hostReportMaxAgeMinutes,
+    now,
+  });
+  if (hostBlock.length) lines.push(...hostBlock);
+
   // Coverage gaps are reported, never hidden. A queue that looks short because
   // one repository could not be read is worse than no answer at all.
   if (unreadableRepos.length) {
@@ -235,6 +341,19 @@ export async function cmdJobs(config, opts = {}, deps = { queueFor }) {
       "",
       style.yellow(
         `Not read: ${unreadableRepos.join(", ")} (${unreadableRepos.length} repo(s) could not be listed, so the queue above is incomplete)`,
+      ),
+    );
+  }
+
+  // An unreadable host report is a gap in the same sense: whatever it would have
+  // said about disk is now simply not being claimed, and that is worth saying.
+  if (hostErrors.length) {
+    lines.push(
+      "",
+      style.yellow(
+        `Host reports not read: ${hostErrors
+          .map((e) => e.file)
+          .join(", ")} (${hostErrors.length} report(s) could not be parsed, so disk pressure is not being checked for them)`,
       ),
     );
   }
@@ -306,8 +425,6 @@ function bytes(n) {
   }
   return `${i === 0 ? value : value.toFixed(1)} ${units[i]}`;
 }
-
-const round = (n) => Math.round(Number(n) || 0);
 
 /**
  * Removes stale checkouts and prunes orphaned worktrees from a runner's `_work`.

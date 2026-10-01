@@ -131,6 +131,35 @@ export const SCHEMA = [
     env: "RUNNER_QUEUE_CLEANUP_AGE_HOURS",
     help: "how old a checkout has to be before clean will remove it",
   },
+  {
+    key: "hostReportDir",
+    type: "string",
+    nullable: true,
+    default: null,
+    flag: "host-report-dir",
+    env: "RUNNER_QUEUE_HOST_REPORT_DIR",
+    help: "directory of host reports, read by jobs to check runner disk space",
+  },
+  {
+    key: "hostReportMaxAgeMinutes",
+    type: "number",
+    integer: true,
+    min: 1,
+    default: 30,
+    flag: "host-report-max-age",
+    env: "RUNNER_QUEUE_HOST_REPORT_MAX_AGE",
+    help: "how old a host report may be before it is ignored",
+  },
+  {
+    key: "hostDiskFreePercent",
+    type: "number",
+    min: 0,
+    max: 100,
+    default: 5,
+    flag: "host-disk-free",
+    env: "RUNNER_QUEUE_HOST_DISK_FREE",
+    help: "free disk percent below which a host counts as out of space",
+  },
 ];
 
 const BY_KEY = new Map(SCHEMA.map((entry) => [entry.key, entry]));
