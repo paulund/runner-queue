@@ -1,16 +1,15 @@
 /**
- * The runner host's own filesystem: the work directories it is sitting on.
+ * The runner host's own filesystem: the work directories it is sitting on, and
+ * the host reports that say how much room is left on them.
  *
  * This is the one place in the tool that looks at something other than the
- * GitHub API, and it exists because a runner host fills up. GitHub does not
- * report a full disk through any endpoint; the machine simply keeps accepting
- * jobs and failing them, or stops being picked at all.
- *
- * Everything destructive in the tool goes through here, so the safety rules are
- * stated once rather than at each call site.
+ * GitHub API, and it exists because a full disk is invisible from outside. A
+ * runner with no space reports itself online, may report itself idle, and the
+ * job it was supposed to pick up simply never runs. Reading the host is how
+ * that stops being a mystery.
  */
 import { execFile } from "node:child_process";
-import { readdir, realpath, rm, stat, statfs } from "node:fs/promises";
+import { readdir, readFile, realpath, rm, stat, statfs } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -25,6 +24,17 @@ import { promisify } from "node:util";
  * @property {(path: string, opts?: any) => Promise<void>} [rm]
  */
 
+/**
+ * Reports keyed by the runner they describe, with the thresholds to read them
+ * against.
+ *
+ * @typedef {object} HostIndex
+ * @property {Map<string, any>} index reports by runner name
+ * @property {any[]} reports the reports as read, in file-name order
+ * @property {number} minFreePercent free disk percent below which a host is tight
+ * @property {number} maxAgeMinutes how old a report may be and still be believed
+ */
+
 const run = promisify(execFile);
 
 /**
@@ -34,6 +44,129 @@ const run = promisify(execFile);
  * a run rather than tidy one.
  */
 const RESERVED = new Set(["_temp", "_actions", "_diag", "_logs", "_runner_file_commands"]);
+
+// --- host reports ---------------------------------------------------------
+
+/**
+ * Reads every `*.json` report in a directory.
+ *
+ * A missing directory is reported rather than thrown, for the same reason an
+ * unreadable repository is: a host that has not reported yet is a gap in the
+ * evidence, and the queue report is still worth printing without it. What it
+ * must not do is quietly present "no reports" as "no disk problems".
+ *
+ * @param {string} dir
+ * @returns {Promise<{ reports: any[], errors: { file: string, message: string }[] }>}
+ */
+export async function readHostReports(dir) {
+  if (!dir) return { reports: [], errors: [] };
+
+  let entries;
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    return {
+      reports: [],
+      errors: [
+        {
+          file: dir,
+          message: `could not read host report directory: ${err.code ?? err.message}`,
+        },
+      ],
+    };
+  }
+
+  const reports = [];
+  const errors = [];
+
+  for (const name of entries.filter((e) => e.endsWith(".json")).sort()) {
+    try {
+      const report = JSON.parse(await readFile(join(dir, name), "utf8"));
+      if (!report || typeof report !== "object" || Array.isArray(report)) {
+        throw new Error("not a JSON object");
+      }
+      // The file name is the runner name. A report that does not name itself is
+      // unusable, because nothing else can attribute it to a machine.
+      reports.push({ ...report, runner: report.runner ?? name.replace(/\.json$/, "") });
+    } catch (err) {
+      errors.push({ file: name, message: err.message });
+    }
+  }
+
+  return { reports, errors };
+}
+
+/**
+ * Packages reports with the thresholds they should be read against.
+ *
+ * The thresholds travel with the reports rather than being passed alongside at
+ * every call site, because the two are only ever meaningful together: a report
+ * judged against somebody else's free-space limit is not a fact.
+ *
+ * @param {any[]} reports
+ * @param {{ minFreePercent?: number, maxAgeMinutes?: number }} [thresholds]
+ * @returns {HostIndex}
+ */
+export function hostIndex(reports, { minFreePercent = 5, maxAgeMinutes = 30 } = {}) {
+  const index = new Map();
+  for (const report of reports ?? []) {
+    if (report?.runner) index.set(report.runner, report);
+  }
+  return { index, reports: reports ?? [], minFreePercent, maxAgeMinutes };
+}
+
+/** Reads a report back out by runner name, tolerating an absent index. */
+export const hostReportFor = (hosts, name) => hosts?.index?.get(name) ?? null;
+
+/**
+ * Whether a report says the disk is too full to be trusted with another
+ * checkout.
+ *
+ * Compared against a percentage rather than an absolute byte count, because the
+ * hosts in one org are not all the same size and a fixed number would flag a
+ * large disk as healthy and a small one as failing at the same moment.
+ */
+export function diskPressure(report, minFreePercent) {
+  const free = report?.disk?.freePercent;
+  if (typeof free !== "number" || !Number.isFinite(free)) return false;
+  return free < minFreePercent;
+}
+
+/**
+ * Whether a report can still be believed.
+ *
+ * A stale report is worse than none. One written an hour ago saying the disk is
+ * 90% free, when the disk filled up since, would turn a plain `scheduling`
+ * answer into a confident wrong one -- which is the failure mode this tool
+ * exists to avoid, so an old report is treated as no report.
+ */
+export function isFresh(report, maxAgeMinutes, now = Date.now()) {
+  if (typeof report?.at !== "string") return false;
+  const at = new Date(report.at).getTime();
+  if (!Number.isFinite(at)) return false;
+  const ageMs = now - at;
+  return ageMs >= 0 && ageMs <= maxAgeMinutes * 60_000;
+}
+
+/**
+ * Whether a runner is known to be out of disk.
+ *
+ * Three-valued on purpose: a runner with no report, or a stale one, is `null`
+ * rather than `false`. The diagnosis needs the difference between "reported
+ * healthy" and "never asked", or it will report a confident cause for every job
+ * on a host nobody has instrumented.
+ */
+export function pressureFor(runner, hosts, { now = Date.now() } = {}) {
+  const report = hostReportFor(hosts, runner?.name);
+  if (!report || !isFresh(report, hosts.maxAgeMinutes, now)) return null;
+  return diskPressure(report, hosts.minFreePercent);
+}
+
+/** Free disk percent as reported, or `null` when there is nothing to report. */
+export function freePercentFor(runner, hosts) {
+  const free = hostReportFor(hosts, runner?.name)?.disk?.freePercent;
+  return typeof free === "number" && Number.isFinite(free) ? free : null;
+}
 
 // --- disk -----------------------------------------------------------------
 

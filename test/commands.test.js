@@ -7,6 +7,7 @@ import { parseArgs, OPTIONS } from "../src/args.js";
 import { COMMANDS, cmdClean, cmdJobs, cmdWait } from "../src/commands.js";
 import { SCHEMA, loadConfig } from "../src/config.js";
 import { EXIT } from "../src/errors.js";
+import { hostIndex } from "../src/hosts.js";
 
 /**
  * Both commands talk to GitHub, so their presentation is tested by injecting
@@ -145,9 +146,103 @@ test("every option is reachable under the name its own spec declares", () => {
   }
 });
 
-// --- clean ---
+// --- jobs: the host block ---
 
 const NOW = Date.parse("2026-01-01T01:00:00Z");
+
+/** A host index shaped the way `queueFor` builds it. */
+const reported = (reports, thresholds = {}) =>
+  hostIndex(reports, { minFreePercent: 5, maxAgeMinutes: 30, ...thresholds });
+
+test("jobs shows which hosts reported, tight ones included", async () => {
+  const result = await cmdJobs(await config(), { now: NOW }, {
+    queueFor: async () =>
+      queue([job({ cause: "host_disk_pressure", detail: "r1 is out of disk" })], {
+        hosts: reported([
+          { runner: "r1", at: new Date(NOW).toISOString(), disk: { freePercent: 1 } },
+          { runner: "r2", at: new Date(NOW).toISOString(), disk: { freePercent: 80 } },
+        ]),
+      }),
+  });
+
+  assert.match(result.out, /Hosts/);
+  assert.match(result.out, /r1\s+1% free\s+under 5%/);
+  assert.match(result.out, /r2\s+80% free/);
+});
+
+test("a configured report directory with nothing in it says so", async () => {
+  // Silence must not read as health. With reports configured and none present,
+  // the tool has to admit it is not checking disk at all.
+  const result = await cmdJobs(await config(), { now: NOW }, {
+    queueFor: async () => queue([job()], { hosts: reported([]) }),
+  });
+  assert.match(result.out, /no reports in the host report directory/);
+  assert.match(result.out, /not being checked against disk/);
+});
+
+test("an unreadable host report is named as a gap", async () => {
+  const result = await cmdJobs(await config(), { now: NOW }, {
+    queueFor: async () =>
+      queue([job()], {
+        hosts: reported([
+          { runner: "r1", at: new Date(NOW).toISOString(), disk: { freePercent: 90 } },
+        ]),
+        hostErrors: [{ file: "r2.json", message: "not a JSON object" }],
+      }),
+  });
+  assert.match(result.out, /Host reports not read: r2\.json/);
+  assert.match(result.out, /disk pressure is not being checked/);
+});
+
+test("a stale host report is shown but marked as not trusted", async () => {
+  const result = await cmdJobs(await config({ hostReportMaxAgeMinutes: 30 }), { now: NOW }, {
+    queueFor: async () =>
+      queue([job()], {
+        hosts: reported([
+          { runner: "r1", at: new Date(NOW - 3_600_000).toISOString(), disk: { freePercent: 1 } },
+        ]),
+      }),
+  });
+  assert.match(result.out, /r1\s+1% free\s+\(report too old to trust\)/);
+});
+
+test("a host with no disk figures says so rather than showing a bare number", async () => {
+  const result = await cmdJobs(await config(), { now: NOW }, {
+    queueFor: async () =>
+      queue([job()], {
+        hosts: reported([{ runner: "r1", at: new Date(NOW).toISOString(), disk: null }]),
+      }),
+  });
+  assert.match(result.out, /r1\s+disk unknown/);
+});
+
+test("jobs without host reports is unchanged", async () => {
+  const before = await cmdJobs(await config(), {}, { queueFor: async () => queue([job()]) });
+  assert.doesNotMatch(before.out, /Hosts/);
+  assert.doesNotMatch(before.out, /Host reports not read/);
+});
+
+test("jobs --json always carries the hosts key, reports or not", async () => {
+  const without = JSON.parse(
+    (await cmdJobs(await config(), { json: true }, { queueFor: async () => queue([job()]) })).out,
+  );
+  assert.equal(without.hosts, null);
+
+  const withHosts = JSON.parse(
+    (await cmdJobs(await config(), { json: true, now: NOW }, {
+      queueFor: async () =>
+        queue([job()], {
+          hosts: reported([
+            { runner: "r1", at: new Date(NOW).toISOString(), disk: { freePercent: 1 } },
+          ]),
+        }),
+    })).out,
+  );
+  assert.equal(withHosts.hosts.reports.length, 1);
+  assert.equal(withHosts.hosts.minFreePercent, 5);
+});
+
+// --- clean ---
 
 /** A `_work` tree with the given checkout ages in hours. */
 async function workTree(spec) {

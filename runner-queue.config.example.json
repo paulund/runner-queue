@@ -10,5 +10,8 @@
   "queueRunPages": 2,
   "cacheDir": null,
   "workDir": null,
-  "cleanupAgeHours": 24
+  "cleanupAgeHours": 24,
+  "hostReportDir": null,
+  "hostReportMaxAgeMinutes": 30,
+  "hostDiskFreePercent": 5
 }

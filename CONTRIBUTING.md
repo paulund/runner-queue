@@ -78,6 +78,9 @@ because it caught a real bug:
   deleted before the threshold the command prints.
 - `test/hosts.test.js` — a symlink out of `_work` is refused rather than
   followed. `git worktree` creates exactly those, so this is the real shape.
+- `test/hosts.test.js` — a runner nobody reported on is `null`, not `false`. A
+  host with no report and a host reported healthy have to stay distinguishable,
+  or adding reports for one machine starts explaining queues for every other.
 
 Prefer a test that fails before your fix over one that passes after it.
 
@@ -96,6 +99,10 @@ Two rules the table relies on:
 - **A value that cannot be right should fail loudly.** A typo in a config file
   should stop the command, not silently do nothing.
 
+Anything that must not persist across invocations — `--apply` above all — does
+not belong in this table. `OPTIONS` in `src/args.js` is the other list: switches
+that apply to one run and are never read from a config file.
+
 ## Changing output
 
 `--json` output is part of the interface: scripts and agents read it. Add fields
@@ -105,12 +112,22 @@ rather than renaming or removing them, and keep the same names across commands
 Exit codes are part of it too: `0` nothing to do, `1` the command could not do
 its job, `2` it worked and found something to act on.
 
+Add a key rather than leaving it out when it has no data. A `hosts` key that
+appears only when reports happen to exist makes `--json` output change shape
+between runs, and callers have to handle both. `null` is the honest value for
+"not looked at".
+
 ## Reporting a diagnosis you think is wrong
 
 The interesting bugs in this tool are the ones where it confidently names a
 wrong cause. If you find one, the most useful thing is the shape of the input
-that produced it — the job labels, the runner labels and their statuses, and
-which organisation each belonged to. A failing test built from that is ideal.
+that produced it — the job labels, the runner labels and their statuses, which
+organisation each belonged to, and any host reports that were in play. A failing
+test built from that is ideal.
+
+This is why `host_disk_pressure` only fires when *every* eligible runner is
+reported tight. One machine with room is still somewhere for the job to go, and
+the answer is capacity rather than disk.
 
 ## Licence
 

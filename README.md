@@ -219,6 +219,59 @@ Exit code is `2` when there is something to clean, `0` when there is not, and `1
 if a removal failed — so `clean` can run from cron and tell you when a runner is
 filling up. Add `--json` for the same report as data.
 
+#### Checking runner disk space
+
+A runner whose disk is full does not announce it through any endpoint. It shows
+up as `online`, it may show up as idle, and the job it was supposed to pick up
+simply never runs — so from the Actions tab alone there is nothing to see.
+
+Point `jobs` at a directory of host reports and it can say so:
+
+```sh
+runner-queue jobs --org YourOrg --host-report-dir /var/tmp/rq
+```
+
+```
+Hosts
+  runner-01  94% free
+  runner-02  0% free     under 5%
+  runner-03              disk unknown
+```
+
+A host is one JSON file per runner, named `<runner>.json`:
+
+```json
+{
+  "runner": "runner-02",
+  "at": "2026-10-01T08:20:56.663Z",
+  "disk": { "totalBytes": 500107862016, "freeBytes": 2013265920, "freePercent": 0.4 }
+}
+```
+
+`runner` may be omitted, in which case the file name is the identity — that is
+how a host that only knows its own hostname still produces something usable.
+`at` is what makes staleness detectable.
+
+Reading it:
+
+- **A queued job gets `host_disk_pressure` instead of `scheduling` or
+  `all_busy`** when every runner that could have taken it is on a host reported
+  out of disk. It is red, because nothing in the Actions tab looks wrong.
+- **One machine with room is enough to keep the ordinary cause.** Only when
+  *every* eligible runner is tight is it a disk problem; otherwise the answer is
+  capacity.
+- **A host with no report is not reported as healthy.** It is not reported at
+  all, and if the directory is empty the tool says so, so you never read silence
+  as health.
+- **A stale report is ignored rather than trusted.** Past
+  `--host-report-max-age` (default 30 minutes) it stops counting, because a
+  report saying the disk was fine an hour ago is worse than no report at all.
+- **A host with no disk figures says `disk unknown`** rather than showing a
+  number it does not have.
+
+This is entirely optional and additive. With no `--host-report-dir`, `jobs`
+behaves exactly as it did before.
+
 ---
 
 ### Exit codes
@@ -274,6 +327,9 @@ The file is looked for in this order, and the first that exists wins:
 | `cacheDir` | `--cache-dir` | `RUNNER_QUEUE_CACHE` | `$XDG_CACHE_HOME/runner-queue` | Where history is cached |
 | `workDir` | `--work-dir` | `RUNNER_WORK` | `$RUNNER_WORK` | A runner's `_work` directory, for `clean`. The runner exports this itself, so it usually needs no configuration |
 | `cleanupAgeHours` | `--cleanup-age-hours` | `RUNNER_QUEUE_CLEANUP_AGE_HOURS` | `24` | How old a checkout has to be before `clean` will remove it |
+| `hostReportDir` | `--host-report-dir` | `RUNNER_QUEUE_HOST_REPORT_DIR` | `null` | Directory of host reports, read by `jobs` to check runner disk space |
+| `hostReportMaxAgeMinutes` | `--host-report-max-age` | `RUNNER_QUEUE_HOST_REPORT_MAX_AGE` | `30` | How old a host report may be before `jobs` ignores it |
+| `hostDiskFreePercent` | `--host-disk-free` | `RUNNER_QUEUE_HOST_DISK_FREE` | `5` | Free disk percent below which a host counts as out of space |
 
 Unknown keys are rejected, so a typo fails loudly instead of silently doing
 nothing.
@@ -314,7 +370,13 @@ For each queued job the tool reports one of:
 | `no_runners_online` | Nothing is online to run it | Start the fleet |
 | `runner_offline` | The only matching runners are offline | Switch them on, or add more |
 | `label_mismatch` | No runner carries the labels the job requires | Fix the labels, in the workflow or on the runner |
+| `host_disk_pressure` | Every runner that could take this job is on a host reported out of disk | Free space on the host, then `clean` |
 | `unknown_capacity` | Runner state unavailable; the cause is undetermined | Grant the `admin:org` scope |
+
+`host_disk_pressure` needs host reports to be configured; see
+[checking runner disk space](#checking-runner-disk-space). Without them the tool
+cannot tell a full disk from a healthy idle runner, and says `scheduling` as
+before.
 
 ## `--json`
 
