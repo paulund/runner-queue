@@ -78,6 +78,9 @@ because it caught a real bug:
   as `runner_offline`, and a job never matches another org's runners.
 - `test/github.test.js` — only jobs whose own status is `queued` count as
   waiting, because GitHub leaves a run marked `queued` while its jobs run.
+- `test/hosts.test.js` — a directory that has already gone counts as removed.
+  The runner clears `_work` itself, and overlapping `clean` runs race, so `ENOENT`
+  is the intended state rather than a failure.
 - `test/hosts.test.js` — age is floored, not rounded up, so a checkout is never
   deleted before the threshold the command prints.
 - `test/hosts.test.js` — a symlink out of `_work` is refused rather than
@@ -115,6 +118,10 @@ rather than renaming or removing them, and keep the same names across commands
 
 Exit codes are part of it too: `0` nothing to do, `1` the command could not do
 its job, `2` it worked and found something to act on.
+
+`0` has to mean genuinely quiet. A command run from cron that exits `2` when it
+found nothing will eventually get its failure alerts ignored, and then it will
+never be read again.
 
 Add a key rather than leaving it out when it has no data. A `hosts` key that
 appears only when reports happen to exist makes `--json` output change shape

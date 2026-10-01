@@ -7,7 +7,7 @@ import { parseArgs, OPTIONS } from "../src/args.js";
 import { COMMANDS, cmdClean, cmdJobs, cmdWait } from "../src/commands.js";
 import { SCHEMA, loadConfig } from "../src/config.js";
 import { EXIT } from "../src/errors.js";
-import { hostIndex } from "../src/hosts.js";
+import { hostIndex, hostReportFor, readHostReports } from "../src/hosts.js";
 
 /**
  * Both commands talk to GitHub, so their presentation is tested by injecting
@@ -314,6 +314,55 @@ test("clean reports nothing to do when everything is fresh", async () => {
   assert.match(result.out, /Nothing to clean/);
 });
 
+test("clean exits 0 when there is nothing to do, so a cron run stays quiet", async () => {
+  // Regression: a clean runner exited 2, so a nightly schedule would alert every
+  // time -- which is the surest way to get a cron failure ignored.
+  const root = await workTree({ "acme/api/main": 1 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.equal(result.code, EXIT.ok);
+});
+
+test("clean exits 2 when something is stale, even in a dry run", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const dry = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.equal(dry.code, EXIT.attention, "there is something worth acting on");
+
+  const applied = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.equal(applied.code, EXIT.attention);
+});
+
+test("a failure outranks a dry run, even with nothing stale", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, now: NOW, env: {} },
+    cleanDeps({ remove: async (_r, p) => ({ removed: false, path: p, error: "EACCES" }) }),
+  );
+  assert.equal(result.code, EXIT.error);
+});
+
+test("clean --json says whether there was anything stale", async () => {
+  const root = await workTree({ "acme/api/main": 1 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { json: true, now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.equal(JSON.parse(result.out).stale, false);
+});
+
 test("clean needs a work directory and says where to set one", async () => {
   // Thrown, not returned: it is a "you have not told us something we need"
   // message, so it belongs with the other config errors and on stderr.
@@ -466,8 +515,6 @@ test("clean --json reports what it did as data", async () => {
 });
 
 test("the file written is named after the runner and says so inside", async () => {
-  // The real writer, not a stub: the name on disk and the `runner` field inside
-  // it have to agree, or `jobs` cannot match the report to anything.
   const root = await workTree({ "acme/api/main": 50 });
   const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
   await cmdClean(
@@ -480,6 +527,66 @@ test("the file written is named after the runner and says so inside", async () =
   assert.equal(written.runner, "runner-07");
   assert.equal(written.hostname, "build07");
   assert.equal(typeof written.disk.freePercent, "number");
+});
+
+test("a mixed-case runner name survives inside the report", async () => {
+  // Regression: the name was slugged into the `runner` field as well as the
+  // filename. GitHub matches reports by comparing that field against the runner
+  // name in the API, and runner names are often mixed-case -- so every report
+  // from a `Build-Agent-01` was silently unmatched, with nothing to say why.
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "Build-Agent-01", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+
+  // Sanitised for the filename, verbatim inside the file.
+  const written = JSON.parse(await readFile(join(dir, "build-agent-01.json"), "utf8"));
+  assert.equal(written.runner, "Build-Agent-01");
+});
+
+test("a report for a mixed-case runner is found by the name GitHub knows it as", async () => {
+  // The end of the regression above: write a report the way a runner would, then
+  // look it up by the API's spelling rather than by the file name.
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "Build-Agent-01", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+
+  const { reports } = await readHostReports(dir);
+  const hosts = hostIndex(reports, { minFreePercent: 5, maxAgeMinutes: 30 });
+  assert.equal(hostReportFor(hosts, "Build-Agent-01")?.runner, "Build-Agent-01");
+});
+
+test("a runner name with characters a filename cannot hold still writes", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "team/blue: runner 1", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+
+  const files = (await readdir(dir)).filter((f) => f.endsWith(".json"));
+  assert.equal(files.length, 1, `expected one report, got ${files.join(", ")}`);
+  assert.equal(JSON.parse(await readFile(join(dir, files[0]), "utf8")).runner, "team/blue: runner 1");
+});
+
+test("a runner name that sanitises to nothing still gets a filename", async () => {
+  // Otherwise the report is written somewhere unnameable and cannot be found.
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "///", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith(".json")), ["host.json"]);
 });
 
 test("a host with no runner name falls back to the hostname", async () => {

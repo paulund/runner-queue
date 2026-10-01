@@ -215,10 +215,16 @@ Reading it:
 - **Every path is resolved and checked to be inside `_work`** before removal, so
   a symlink cannot redirect the deletion. `git worktree` creates exactly those
   symlinks, which makes this a real shape rather than a precaution.
+- **A checkout that is already gone counts as removed.** The runner clears
+  `_work` as jobs finish, and two overlapping `clean` runs race the same way; in
+  both cases the directory not existing is the state that was wanted, so neither
+  is reported as a failure. Any other error is.
 
-Exit code is `2` when there is something to clean, `0` when there is not, and `1`
-if a removal failed — so `clean` can run from cron and tell you when a runner is
-filling up. Add `--json` for the same report as data.
+Exit code is `2` when there is something to clean, `0` when there is nothing to
+do, and `1` if a removal failed — so `clean` can run from cron and tell you when
+a runner is filling up without alerting on every clean one. Add `--json` for the
+same report as data; its `stale` field carries the same answer as the exit code
+for a caller reading the payload instead.
 
 #### Reporting disk to `jobs`
 
@@ -233,6 +239,12 @@ space, and `jobs` is what tells you it needed freeing.
 
 The runner names itself, so nothing else needs configuring — `RUNNER_NAME`
 identifies the runner, and `RUNNER_WORK` finds `_work`.
+
+The file name is sanitised so it is safe on disk, but the `runner` field inside
+keeps the name exactly as the runner reported it. That matters because `jobs`
+matches reports by comparing that field against the name in the API, and runner
+names are often mixed-case: `Build-Agent-01` is written to
+`build-agent-01.json` and found again under its real name.
 
 A written report:
 
