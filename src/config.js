@@ -112,6 +112,25 @@ export const SCHEMA = [
     env: "RUNNER_QUEUE_CACHE",
     help: "where history and alert state are cached",
   },
+  {
+    key: "workDir",
+    type: "string",
+    nullable: true,
+    default: null,
+    flag: "work-dir",
+    env: "RUNNER_WORK",
+    help: "a runner's _work directory, for clean",
+  },
+  {
+    key: "cleanupAgeHours",
+    type: "number",
+    integer: true,
+    min: 1,
+    default: 24,
+    flag: "cleanup-age-hours",
+    env: "RUNNER_QUEUE_CLEANUP_AGE_HOURS",
+    help: "how old a checkout has to be before clean will remove it",
+  },
 ];
 
 const BY_KEY = new Map(SCHEMA.map((entry) => [entry.key, entry]));

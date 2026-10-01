@@ -16,13 +16,25 @@ merged.
 
 ## Scope
 
-There are two commands, `jobs` and `wait`, and both are read-only. That is
-deliberate: nothing in this tool can change your CI, so there is no write
-permission to grant, no opt-in flag to forget, and no way for it to be the thing
-that broke a build.
+`jobs` and `wait` are read-only, and that is deliberate: nothing in them can
+change your CI, so there is no write permission to grant, no opt-in flag to
+forget, and no way for either to be the thing that broke a build.
 
-Adding a command that writes to GitHub means adding that whole category back.
-The bar should be that it cannot be done by accident.
+`clean` is the exception, and the only command that writes to anything. It is
+local to the runner host and needs no GitHub permission, but the principle is
+the same one applied harder:
+
+- **It deletes nothing without `--apply`.** The default is a dry run.
+- **`--apply` is an option, not a setting.** A destructive action that a config
+  file can switch on is a destructive action that will eventually be switched on
+  by accident. `--apply` and `--prune` live in `OPTIONS`.
+- **Deletion happens behind an age threshold** (`--cleanup-age-hours`), checked
+  before anything is removed rather than at the point of removal. A directory
+  still in use has a recent mtime; that is the whole of the safety.
+
+If you add a command that writes to GitHub, or that deletes anything without an
+opt-in flag, expect to be asked how it cannot be done by accident. The answer
+should be structural, not a warning in the help text.
 
 ## No runtime dependencies
 
@@ -49,6 +61,12 @@ That seam is why the presentation — what gets printed, and which exit code com
 out — can be tested at all. If you add a command, give it the same seam rather
 than reaching for a live API in a test.
 
+`clean` takes the same seam, and its tests use it in a deliberately mixed way.
+`scan` and `diskUsage` are left as the real functions, pointed at a temporary
+tree, so the age arithmetic and the directory walk are actually exercised.
+`remove` and `pruneWorktrees` are stubbed, because those are the operations that
+must never be pointed at anything real in a test.
+
 Tests worth reading before you touch the code they cover, because each exists
 because it caught a real bug:
 
@@ -56,6 +74,10 @@ because it caught a real bug:
   as `runner_offline`, and a job never matches another org's runners.
 - `test/github.test.js` — only jobs whose own status is `queued` count as
   waiting, because GitHub leaves a run marked `queued` while its jobs run.
+- `test/hosts.test.js` — age is floored, not rounded up, so a checkout is never
+  deleted before the threshold the command prints.
+- `test/hosts.test.js` — a symlink out of `_work` is refused rather than
+  followed. `git worktree` creates exactly those, so this is the real shape.
 
 Prefer a test that fails before your fix over one that passes after it.
 

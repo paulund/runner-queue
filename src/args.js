@@ -19,6 +19,19 @@ import { SCHEMA } from "./config.js";
 export const OPTIONS = {
   config: { type: "value", name: "config", help: "config file to use" },
   json: { type: "boolean", name: "json", help: "machine-readable output" },
+  // Options rather than config settings, on purpose. Anything destructive must
+  // not be something a config file can switch on and leave switched on; see
+  // CONTRIBUTING.md.
+  apply: {
+    type: "boolean",
+    name: "apply",
+    help: "clean: actually delete. Without it, clean only reports",
+  },
+  prune: {
+    type: "boolean",
+    name: "prune",
+    help: "clean: also run `git worktree prune` in each checkout",
+  },
   "exit-zero": {
     type: "boolean",
   

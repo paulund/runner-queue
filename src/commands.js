@@ -1,9 +1,13 @@
 /**
- * The two commands: what is queued and why, and what the wait times look like.
+ * The commands: what is queued and why, what the wait times look like, and what
+ * a runner host is still carrying from jobs that finished.
  *
  * Each returns `{ out, code }` rather than writing to stdout itself, so that
  * every command is testable and `--json` is a formatting decision instead of a
  * second code path.
+ *
+ * `clean` is the only one that changes anything, and it is the reason `--apply`
+ * exists. See `cmdClean` for how that is kept from being an accident.
  */
 import {
   collectHistory,
@@ -13,10 +17,18 @@ import {
 } from "./github.js";
 import { buildQueue, capacitySummary } from "./diagnose.js";
 import {
+  ConfigError,
   cacheFile,
   filterRepos,
   historyKey,
 } from "./config.js";
+import {
+  diskUsage,
+  pruneWorktrees,
+  removeCheckout,
+  scanWorkDir,
+  staleCheckouts,
+} from "./hosts.js";
 import { EXIT } from "./errors.js";
 import { PLAIN, duration, pad, table } from "./format.js";
 
@@ -280,7 +292,243 @@ export async function cmdWait(config, opts = {}, deps = { historyFor }) {
   };
 }
 
+// --- clean ----------------------------------------------------------------
+
+/** A human-readable size. Wrong by a factor of 2^10 would not change a decision. */
+function bytes(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "unknown";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = n;
+  let i = 0;
+  while (Math.abs(value) >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i++;
+  }
+  return `${i === 0 ? value : value.toFixed(1)} ${units[i]}`;
+}
+
+const round = (n) => Math.round(Number(n) || 0);
+
+/**
+ * Removes stale checkouts and prunes orphaned worktrees from a runner's `_work`.
+ *
+ * This is the only command in the tool that deletes, and it is built so that
+ * running it is harmless:
+ *
+ * - **Nothing is removed without `--apply`.** The default is a dry run, so the
+ *   command someone types while curious cannot delete a checkout. `--apply` is
+ *   deliberately an *option* and not a config setting, which means it cannot be
+ *   switched on in a config file and then forgotten about.
+ * - **The age threshold is checked before anything is removed**, not at the
+ *   point of deletion. A directory the runner is still using has a recent
+ *   mtime, so `--cleanup-age-hours` is the only thing standing between a running
+ *   job and a deletion, and it defaults to a day.
+ * - **Every path is resolved and checked for containment** before deletion, so a
+ *   symlink inside `_work` cannot redirect it. `git worktree` creates exactly
+ *   those, which makes this a real shape rather than a precaution.
+ *
+ * The residual risk is inherent: a job that has been running for longer than the
+ * threshold will have its checkout removed underneath it. The threshold is
+ * therefore documented as something to set above your longest job, not as a
+ * detail.
+ *
+ * @param deps the filesystem operations, injectable so the presentation can be
+ *   tested without a real `_work` directory. `scan` and `stats` are left real in
+ *   the tests, pointed at a temporary tree, so the age arithmetic and the walk
+ *   are genuinely exercised; `remove` and `pruneTrees` are stubbed, because
+ *   those are the operations that must not be pointed at anything real.
+ */
+export async function cmdClean(config, opts = {}, deps = {}) {
+  const {
+    json = false,
+    style = PLAIN,
+    apply = false,
+    prune = true,
+    now = Date.now(),
+    env = process.env,
+  } = opts;
+  const {
+    scan = scanWorkDir,
+    remove = removeCheckout,
+    pruneTrees = pruneWorktrees,
+    stats = diskUsage,
+  } = deps;
+
+  // The runner sets RUNNER_WORK itself, so on a self-hosted runner this is
+  // already right without anybody configuring it. `--work-dir` overrides for the
+  // case where the tool is run by hand, or against a service account's copy.
+  const root = config.workDir || env.RUNNER_WORK;
+
+  // Thrown rather than returned, so it lands on stderr with the other "you have
+  // not told us something we need" messages rather than being printed as if it
+  // were a result.
+  if (!root) {
+    throw new ConfigError(
+      [
+        "no work directory to clean.",
+        "",
+        "  Set --work-dir to a runner's _work directory, or run this on the runner",
+        "  itself, where the runner exports RUNNER_WORK for every job.",
+        "",
+        "  runner-queue --work-dir /opt/actions-runner/_work clean",
+      ].join("\n"),
+    );
+  }
+
+  const found = await scan({ root, now });
+  const { stale, kept } = staleCheckouts(found.checkouts, config.cleanupAgeHours);
+  const disk = await stats(found.root);
+
+  const pruned = /** @type {any[]} */ ([]);
+  if (prune) {
+    // Once per repository root, since that is where the worktree admin files
+    // live -- not once per stale ref, which would repeat the same walk.
+    const repos = new Map();
+    for (const checkout of stale) repos.set(checkout.repoPath, checkout.repo);
+    for (const [repoPath, repo] of repos) {
+      pruned.push({ path: repoPath, repo, ...(await pruneTrees(repoPath)) });
+    }
+  }
+
+  const removed = /** @type {any[]} */ ([]);
+  if (apply) {
+    for (const checkout of stale) {
+      const result = await remove(found.root, checkout.path);
+      removed.push({ ...result, rel: checkout.rel });
+    }
+  }
+
+  const failures = removed.filter((r) => r.error);
+  const code = failures.length ? EXIT.error : EXIT.attention;
+
+  // The per-checkout detail, kept for `--json` so a caller can see what each
+  // entry was and how old it was.
+  const cleanedBy = [...stale, ...kept].map((c) => ({
+    path: c.rel,
+    repo: c.repo,
+    ref: c.ref,
+    ageHours: c.ageHours,
+    stale: stale.includes(c),
+  }));
+
+  if (json) {
+    return {
+      out: JSON.stringify(
+        {
+          applied: apply,
+          workDir: found.root,
+          disk,
+          cleanupAgeHours: config.cleanupAgeHours,
+          workDirCount: found.checkouts.length,
+          staleWorkDirs: stale.length,
+          removedWorkDirs: removed.filter((r) => r.removed).length,
+          prunedWorktrees: pruned.filter((p) => p.ok).length,
+          cleanedBy,
+          pruned,
+          removed,
+          errors: [
+            ...failures.map((r) => ({ file: r.rel, message: r.error })),
+            ...pruned.filter((p) => !p.ok).map((p) => ({ file: p.path, message: p.output })),
+          ],
+        },
+        null,
+        2,
+      ),
+      code,
+    };
+  }
+
+  return {
+    out: cleanText({ apply, stale, kept, pruned, removed, disk, config, style }),
+    code,
+  };
+}
+
+function cleanText({ apply, stale, kept, pruned, removed, disk, config, style }) {
+  const lines = [];
+  const verb = apply ? "Removed" : "Would remove";
+  const n = stale.length;
+
+  if (!n) {
+    lines.push(
+      `${style.green("Nothing to clean")} in ${config.workDir ?? "the work directory"}: ${kept.length} checkout(s), all under ${config.cleanupAgeHours}h old.`,
+    );
+  } else {
+    lines.push(
+      `${verb} ${style.bold(String(n))} checkout(s) older than ${config.cleanupAgeHours}h:`,
+      "",
+      ...table(
+        null,
+        stale.map((c) => [pad(`${c.ageHours}h`, 7), c.rel]),
+      ),
+    );
+
+    // Naming what was left behind, not just a count of it. Without this, a
+    // checkout that survived because it is too new to remove is invisible, and
+    // the list above reads as though those were all that exist.
+    if (kept.length) {
+      lines.push(
+        "",
+        style.dim(`  Kept ${kept.length} checkout(s) under ${config.cleanupAgeHours}h old:`),
+        ...table(null, kept.map((c) => [pad(`${c.ageHours}h`, 7), c.rel])).map((l) => `    ${l}`),
+      );
+    }
+  }
+
+  if (disk) {
+    lines.push("", `  disk  ${bytes(disk.freeBytes)} free of ${bytes(disk.totalBytes)} (${round(disk.freePercent)}%)`);
+  }
+
+  const prunedOk = pruned.filter((p) => p.ok);
+  if (prunedOk.length) {
+    lines.push("", style.dim(`  git worktree prune ran in ${prunedOk.length} repository checkout(s).`));
+  }
+
+  const failures = removed.filter((r) => r.error);
+  if (failures.length) {
+    lines.push("", style.red(`  ${failures.length} removal(s) failed:`));
+    for (const f of failures) lines.push(`    ${f.rel}  ${f.error}`);
+  }
+
+  if (!apply && n) {
+    lines.push(
+      "",
+      style.yellow(`  Nothing was deleted. Re-run with --apply to remove them.`),
+    );
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * @typedef {object} Command
+ * @property {string} summary one line for `--help`
+ * @property {(config: any, opts: any, deps?: any) => Promise<{ out: string, code: number }>} run
+ * @property {string[]} [accepts] the `--` options this command reads, for `--help`
+ * @property {boolean} [needsOrg] false for a command that does not talk to GitHub
+ * @property {string} [args] positional arguments, if the command takes any
+ * @property {number} [max] most positionals accepted
+ */
+
+/** @type {Record<string, Command>} */
 export const COMMANDS = {
-  jobs: { summary: "what is queued, and why it is stuck", run: cmdJobs },
-  wait: { summary: "wait-time analytics from recent runs", run: cmdWait },
+  jobs: {
+    summary: "what is queued, and why it is stuck",
+    run: cmdJobs,
+    accepts: [],
+  },
+  wait: {
+    summary: "wait-time analytics from recent runs",
+    run: cmdWait,
+    accepts: [],
+  },
+  clean: {
+    summary: "remove stale checkouts from a runner's _work directory",
+    run: cmdClean,
+    // Reads the filesystem, not GitHub. An organisation is not required, and
+    // demanding one would mean `clean` could not run on the runner it is meant
+    // to clean without also being configured with credentials it has no use for.
+    needsOrg: false,
+    accepts: ["apply", "prune"],
+  },
 };

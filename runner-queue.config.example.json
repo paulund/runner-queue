@@ -8,5 +8,7 @@
   "includeArchived": false,
   "concurrency": 8,
   "queueRunPages": 2,
-  "cacheDir": null
+  "cacheDir": null,
+  "workDir": null,
+  "cleanupAgeHours": 24
 }

@@ -7,12 +7,14 @@ has been sitting there for six hours, how much of your team's day that has
 cost, or whether the answer is more runners or a missing label. This tool
 answers those questions, from the same public API the Actions tab uses.
 
-Two commands:
+Three commands:
 
 - **`jobs`** — the queue, longest wait first, with a plain-English cause for
   each job.
 - **`wait`** — wait-time percentiles, time-to-green, and job-hours lost to
   queueing, so the cost of a slow queue is a number you can argue with.
+- **`clean`** — the one command that changes anything. It reports what a runner
+  host is still carrying from finished jobs and removes it, on request only.
 
 ## Install
 
@@ -164,6 +166,61 @@ the per-job `samples`.
 
 ---
 
+### `clean`
+
+What a runner host is still carrying from jobs that finished. Run it on the
+runner.
+
+```sh
+runner-queue clean                            # report only, deletes nothing
+runner-queue clean --apply                    # actually remove them
+runner-queue clean --apply --prune            # also tidy git's worktree records
+```
+
+```
+Would remove 3 checkout(s) older than 24h:
+
+    72h  acme/api/main
+   120h  acme/api/release
+    72h  acme/web/main
+
+  Kept 1 checkout(s) under 24h old:
+         0h  acme/api/dev
+
+  disk  168.2 GiB free of 192.7 GiB (87%)
+
+  git worktree prune ran in 2 repository checkout(s).
+
+  Nothing was deleted. Re-run with --apply to remove them.
+```
+
+Reading it:
+
+- **Nothing is deleted without `--apply`.** The default is a dry run. This is the
+  one command in the tool that changes anything, so it is built so that running
+  it out of curiosity cannot hurt anything.
+- **`--apply` is a flag, deliberately not a setting.** It cannot be switched on in
+  a config file and then forgotten about.
+- **Only checkouts older than `--cleanup-age-hours` (default 24) are
+  candidates.** A directory the runner is still using has a recent mtime, so that
+  threshold is what stands between a running job and a deletion. Set it above
+  your longest job.
+- **`git worktree prune` is separate from the removals** and is reported
+  separately, because it does something different: it removes git's own records
+  of worktrees whose directories are already gone.
+- **`_temp` and the other runner-owned directories are never candidates.**
+  `_temp` can hold a job mid-transfer; deleting it corrupts a run rather than
+  tidying one.
+- **Every path is resolved and checked to be inside `_work`** before removal, so
+  a symlink cannot redirect the deletion. `git worktree` creates exactly those
+  symlinks, which makes this a real shape rather than a precaution.
+
+Exit code is `2` when there is something to clean, `0` when there is not, and `1`
+if a removal failed — so `clean` can run from cron and tell you when a runner is
+filling up. Add `--json` for the same report as data.
+
+---
+
 ### Exit codes
 
 | Code | Meaning |
@@ -215,6 +272,8 @@ The file is looked for in this order, and the first that exists wins:
 | `concurrency` | `--concurrency` | `RUNNER_QUEUE_CONCURRENCY` | `8` | GitHub requests in flight at once |
 | `queueRunPages` | `--queue-pages` | `RUNNER_QUEUE_QUEUE_PAGES` | `2` | Pages of queued runs to read per repo, 100 each. Raise it for a deep backlog |
 | `cacheDir` | `--cache-dir` | `RUNNER_QUEUE_CACHE` | `$XDG_CACHE_HOME/runner-queue` | Where history is cached |
+| `workDir` | `--work-dir` | `RUNNER_WORK` | `$RUNNER_WORK` | A runner's `_work` directory, for `clean`. The runner exports this itself, so it usually needs no configuration |
+| `cleanupAgeHours` | `--cleanup-age-hours` | `RUNNER_QUEUE_CLEANUP_AGE_HOURS` | `24` | How old a checkout has to be before `clean` will remove it |
 
 Unknown keys are rejected, so a typo fails loudly instead of silently doing
 nothing.
