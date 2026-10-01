@@ -138,7 +138,7 @@ export const SCHEMA = [
     default: null,
     flag: "host-report-dir",
     env: "RUNNER_QUEUE_HOST_REPORT_DIR",
-    help: "directory of host reports, read by jobs to check runner disk space",
+    help: "directory of host reports (written by clean, read by jobs)",
   },
   {
     key: "hostReportMaxAgeMinutes",

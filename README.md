@@ -175,6 +175,7 @@ runner.
 runner-queue clean                            # report only, deletes nothing
 runner-queue clean --apply                    # actually remove them
 runner-queue clean --apply --prune            # also tidy git's worktree records
+runner-queue clean --report --apply           # and write a report for `jobs`
 ```
 
 ```
@@ -219,13 +220,48 @@ Exit code is `2` when there is something to clean, `0` when there is not, and `1
 if a removal failed — so `clean` can run from cron and tell you when a runner is
 filling up. Add `--json` for the same report as data.
 
-#### Checking runner disk space
+#### Reporting disk to `jobs`
 
-A runner whose disk is full does not announce it through any endpoint. It shows
-up as `online`, it may show up as idle, and the job it was supposed to pick up
-simply never runs — so from the Actions tab alone there is nothing to see.
+`--report` writes a small JSON file per runner into `--host-report-dir`, and
+`jobs --host-report-dir` reads them back. That is the loop: `clean` frees the
+space, and `jobs` is what tells you it needed freeing.
 
-Point `jobs` at a directory of host reports and it can say so:
+```yaml
+# On the runner, as a scheduled job:
+- run: runner-queue clean --apply --prune --report --host-report-dir /var/tmp/rq
+```
+
+The runner names itself, so nothing else needs configuring — `RUNNER_NAME`
+identifies the runner, and `RUNNER_WORK` finds `_work`.
+
+A written report:
+
+```json
+{
+  "runner": "runner-07",
+  "hostname": "build07",
+  "at": "2026-10-01T08:20:56.663Z",
+  "workDir": "/opt/actions-runner/_work",
+  "disk": { "totalBytes": 500107862016, "freeBytes": 2013265920, "freePercent": 0.4 },
+  "workDirCount": 2,
+  "staleWorkDirs": 1,
+  "removedWorkDirs": 1,
+  "prunedWorktrees": 2,
+  "errors": []
+}
+```
+
+- **It counts rather than lists the work directories.** The report is written
+  *after* the removals, so an inventory taken beforehand would describe
+  directories that no longer exist — and `jobs` reads this to judge whether a
+  disk is full, where a stale inventory is worse than none.
+- **A dry run still reports.** "This host is nearly full" is true whether or not
+  `--apply` was passed, and the dry run is often the one you want on a schedule.
+- **`errors` is carried in the report too**, so a removal that failed with
+  `EACCES` is visible from the machine reading the reports, not only on the host
+  where it happened.
+
+Then, from wherever you can read those reports:
 
 ```sh
 runner-queue jobs --org YourOrg --host-report-dir /var/tmp/rq
@@ -238,19 +274,8 @@ Hosts
   runner-03              disk unknown
 ```
 
-A host is one JSON file per runner, named `<runner>.json`:
-
-```json
-{
-  "runner": "runner-02",
-  "at": "2026-10-01T08:20:56.663Z",
-  "disk": { "totalBytes": 500107862016, "freeBytes": 2013265920, "freePercent": 0.4 }
-}
-```
-
-`runner` may be omitted, in which case the file name is the identity — that is
-how a host that only knows its own hostname still produces something usable.
-`at` is what makes staleness detectable.
+A host is one JSON file per runner, named `<runner>.json`, which is what
+`clean --report` writes and what the block above shows.
 
 Reading it:
 
@@ -327,7 +352,7 @@ The file is looked for in this order, and the first that exists wins:
 | `cacheDir` | `--cache-dir` | `RUNNER_QUEUE_CACHE` | `$XDG_CACHE_HOME/runner-queue` | Where history is cached |
 | `workDir` | `--work-dir` | `RUNNER_WORK` | `$RUNNER_WORK` | A runner's `_work` directory, for `clean`. The runner exports this itself, so it usually needs no configuration |
 | `cleanupAgeHours` | `--cleanup-age-hours` | `RUNNER_QUEUE_CLEANUP_AGE_HOURS` | `24` | How old a checkout has to be before `clean` will remove it |
-| `hostReportDir` | `--host-report-dir` | `RUNNER_QUEUE_HOST_REPORT_DIR` | `null` | Directory of host reports, read by `jobs` to check runner disk space |
+| `hostReportDir` | `--host-report-dir` | `RUNNER_QUEUE_HOST_REPORT_DIR` | `null` | Directory of host reports. Written by `clean --report`, read by `jobs` |
 | `hostReportMaxAgeMinutes` | `--host-report-max-age` | `RUNNER_QUEUE_HOST_REPORT_MAX_AGE` | `30` | How old a host report may be before `jobs` ignores it |
 | `hostDiskFreePercent` | `--host-disk-free` | `RUNNER_QUEUE_HOST_DISK_FREE` | `5` | Free disk percent below which a host counts as out of space |
 

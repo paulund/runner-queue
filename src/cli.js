@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { hostname as hostName } from "node:os";
 import { APP, SCHEMA, loadConfig } from "./config.js";
 import { OPTIONS, parseArgs } from "./args.js";
 import { COMMANDS } from "./commands.js";
@@ -195,6 +196,12 @@ async function main(argv) {
     // One clock for the whole run, so that a decision and the number printed
     // beside it cannot disagree about when "now" was.
     now: Date.now(),
+    // Which machine this is, and which runner it presents itself as, taken from
+    // the environment rather than configured. On a self-hosted runner both are
+    // already set, so `clean --report` needs no configuration to name itself in
+    // a report that `jobs` will later match against a runner in the API.
+    hostname: hostName(),
+    runner: process.env.RUNNER_NAME ?? null,
   });
 
   out(result.out);

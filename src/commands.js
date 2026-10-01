@@ -25,6 +25,7 @@ import {
 import {
   diskUsage,
   hostIndex,
+  hostReport,
   isFresh,
   pruneWorktrees,
   readHostReports,
@@ -461,14 +462,21 @@ export async function cmdClean(config, opts = {}, deps = {}) {
     style = PLAIN,
     apply = false,
     prune = true,
+    // `report`, matching the flag's own name in OPTIONS. Renaming it here would
+    // mean `clean --report` silently did nothing, which is the exact failure
+    // the schema test guards against for settings.
+    report = false,
     now = Date.now(),
     env = process.env,
+    runner = null,
+    hostname = null,
   } = opts;
   const {
     scan = scanWorkDir,
     remove = removeCheckout,
     pruneTrees = pruneWorktrees,
     stats = diskUsage,
+    save = writeHostReport,
   } = deps;
 
   // The runner sets RUNNER_WORK itself, so on a self-hosted runner this is
@@ -518,8 +526,36 @@ export async function cmdClean(config, opts = {}, deps = {}) {
   const failures = removed.filter((r) => r.error);
   const code = failures.length ? EXIT.error : EXIT.attention;
 
+  const errors = [
+    ...failures.map((r) => ({ file: r.rel, message: r.error })),
+    ...pruned.filter((p) => !p.ok).map((p) => ({ file: p.path, message: p.output })),
+  ];
+
+  const reportData = hostReport({
+    runner,
+    hostname,
+    root: found.root,
+    disk,
+    checkouts: found.checkouts,
+    stale,
+    removed,
+    pruned: pruned.filter((p) => p.ok).length,
+    errors,
+    now,
+  });
+
+  // The report is the point of running this from a job rather than by hand: it
+  // is what lets `jobs` name a full disk as the cause of a queued job. Written
+  // whether or not `--apply` was given, because "this host is nearly full" is
+  // true either way, and a dry run is often the one worth having.
+  let reportPath = null;
+  if (report) {
+    reportPath = await save(config.hostReportDir, runner, reportData);
+  }
+
   // The per-checkout detail, kept for `--json` so a caller can see what each
-  // entry was and how old it was.
+  // entry was and how old it was. Deliberately not in the host report: it is
+  // about this run, whereas the report is about the host.
   const cleanedBy = [...stale, ...kept].map((c) => ({
     path: c.rel,
     repo: c.repo,
@@ -532,21 +568,14 @@ export async function cmdClean(config, opts = {}, deps = {}) {
     return {
       out: JSON.stringify(
         {
+          ...reportData,
           applied: apply,
-          workDir: found.root,
-          disk,
           cleanupAgeHours: config.cleanupAgeHours,
-          workDirCount: found.checkouts.length,
-          staleWorkDirs: stale.length,
-          removedWorkDirs: removed.filter((r) => r.removed).length,
-          prunedWorktrees: pruned.filter((p) => p.ok).length,
           cleanedBy,
           pruned,
           removed,
-          errors: [
-            ...failures.map((r) => ({ file: r.rel, message: r.error })),
-            ...pruned.filter((p) => !p.ok).map((p) => ({ file: p.path, message: p.output })),
-          ],
+          errors,
+          reportPath,
         },
         null,
         2,
@@ -556,12 +585,41 @@ export async function cmdClean(config, opts = {}, deps = {}) {
   }
 
   return {
-    out: cleanText({ apply, stale, kept, pruned, removed, disk, config, style }),
+    out: cleanText({ apply, stale, kept, pruned, removed, disk, config, report, reportPath, style }),
     code,
   };
 }
 
-function cleanText({ apply, stale, kept, pruned, removed, disk, config, style }) {
+/**
+ * Writes a report where `jobs` will look for it, named after the runner so the
+ * two sides agree on identity without exchanging anything else.
+ *
+ * Named by runner name where the runner declared one and by machine hostname
+ * otherwise, because a report nobody can attribute is a report `jobs` cannot
+ * use. The same name is written into the file, so the name on disk and the name
+ * inside it can never disagree.
+ *
+ * A missing directory is created: the point is that `clean` can be run from a
+ * job with no prior setup.
+ *
+ * @returns {Promise<string | null>} the path written, or null if there was
+ *   nowhere to write it
+ */
+async function writeHostReport(dir, runner, report) {
+  if (!dir) return null;
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const name = slug(runner ?? report.hostname);
+  const path = join(dir, `${name}.json`);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, `${JSON.stringify({ ...report, runner: name }, null, 2)}\n`);
+  return path;
+}
+
+const slug = (value) =>
+  String(value ?? "host").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+function cleanText({ apply, stale, kept, pruned, removed, disk, config, report, reportPath, style }) {
   const lines = [];
   const verb = apply ? "Removed" : "Would remove";
   const n = stale.length;
@@ -614,6 +672,17 @@ function cleanText({ apply, stale, kept, pruned, removed, disk, config, style })
     );
   }
 
+  if (report) {
+    lines.push(
+      "",
+      reportPath
+        ? style.dim(`  Host report written to ${reportPath}.`)
+        : style.yellow(
+            `  --report was asked for but no host report directory is set (--host-report-dir).`,
+          ),
+    );
+  }
+
   return lines.join("\n");
 }
 
@@ -646,6 +715,6 @@ export const COMMANDS = {
     // demanding one would mean `clean` could not run on the runner it is meant
     // to clean without also being configured with credentials it has no use for.
     needsOrg: false,
-    accepts: ["apply", "prune"],
+    accepts: ["apply", "prune", "report"],
   },
 };
