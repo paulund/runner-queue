@@ -524,7 +524,17 @@ export async function cmdClean(config, opts = {}, deps = {}) {
   }
 
   const failures = removed.filter((r) => r.error);
-  const code = failures.length ? EXIT.error : EXIT.attention;
+
+  // Three outcomes, three codes: a removal that failed is an error; something
+  // was removed, or something is there to remove, is worth acting on; and
+  // nothing to do is quiet. Collapsing the last two into `2` would make a nightly
+  // `clean` exit non-zero on every clean runner, which is the surest way to get
+  // a cron alert ignored.
+  const code = failures.length
+    ? EXIT.error
+    : stale.length
+      ? EXIT.attention
+      : EXIT.ok;
 
   const errors = [
     ...failures.map((r) => ({ file: r.rel, message: r.error })),
@@ -571,6 +581,10 @@ export async function cmdClean(config, opts = {}, deps = {}) {
           ...reportData,
           applied: apply,
           cleanupAgeHours: config.cleanupAgeHours,
+          // `code` is included so a `--json` caller reading the payload rather
+          // than the exit status can see the same three-way answer: did anything
+          // fail, is there anything to do, or is this a no-op run.
+          stale: stale.length > 0,
           cleanedBy,
           pruned,
           removed,
@@ -594,10 +608,12 @@ export async function cmdClean(config, opts = {}, deps = {}) {
  * Writes a report where `jobs` will look for it, named after the runner so the
  * two sides agree on identity without exchanging anything else.
  *
- * Named by runner name where the runner declared one and by machine hostname
- * otherwise, because a report nobody can attribute is a report `jobs` cannot
- * use. The same name is written into the file, so the name on disk and the name
- * inside it can never disagree.
+ * The filename is sanitised; the `runner` field keeps the name exactly as the
+ * runner reported it. That difference matters: GitHub matches a report to a
+ * runner by comparing the field against the name in the API, and runner names
+ * are frequently mixed-case (`Build-Agent-01`). Lower-casing the field as well
+ * would make every such report unmatchable, and silently so -- the report would
+ * simply never be found, with nothing to say why.
  *
  * A missing directory is created: the point is that `clean` can be run from a
  * job with no prior setup.
@@ -609,15 +625,19 @@ async function writeHostReport(dir, runner, report) {
   if (!dir) return null;
   const { mkdir, writeFile } = await import("node:fs/promises");
   const { join } = await import("node:path");
-  const name = slug(runner ?? report.hostname);
-  const path = join(dir, `${name}.json`);
+  const path = join(dir, `${slug(runner ?? report.hostname)}.json`);
   await mkdir(dir, { recursive: true });
-  await writeFile(path, `${JSON.stringify({ ...report, runner: name }, null, 2)}\n`);
+  await writeFile(path, `${JSON.stringify(report, null, 2)}\n`);
   return path;
 }
 
+/**
+ * A filename-safe version of a runner name. Never applied to the name itself --
+ * see `writeHostReport`. Falls back to `host` rather than producing a nameless
+ * file, so an unattributable report is at least still written and can be seen.
+ */
 const slug = (value) =>
-  String(value ?? "host").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  String(value ?? "host").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "host";
 
 function cleanText({ apply, stale, kept, pruned, removed, disk, config, report, reportPath, style }) {
   const lines = [];

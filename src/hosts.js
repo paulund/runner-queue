@@ -364,6 +364,12 @@ export function staleCheckouts(checkouts, minAgeHours) {
  * deletion somewhere else. `git worktree` makes exactly these symlinks, so this
  * is a real shape rather than a theoretical one.
  *
+ * A directory that has already gone counts as removed. The runner clears `_work`
+ * itself as it finishes jobs, so a checkout scanned a moment ago can be gone by
+ * the time it is deleted -- and two overlapping `clean` runs (routine from cron)
+ * race the same way. In both cases the intended state was reached, and reporting
+ * `ENOENT` as a failure would make a clean run exit `1` for having done its job.
+ *
  * @param {string} root resolved work directory root
  * @param {string} path the checkout to remove
  * @param {{ fs?: Io }} [options]
@@ -377,6 +383,9 @@ export async function removeCheckout(root, path, { fs: io = {} } = {}) {
   try {
     real = await resolveReal(path);
   } catch (err) {
+    // The directory was never there, or went while we looked. Either way it is
+    // not there now, which is what the removal was for.
+    if (err.code === "ENOENT") return { removed: true, path };
     return { removed: false, path, error: err.code ?? err.message };
   }
   if (!within(root, real) || real === root) {
@@ -386,6 +395,7 @@ export async function removeCheckout(root, path, { fs: io = {} } = {}) {
     await remove(real, { recursive: true, force: true });
     return { removed: true, path: real };
   } catch (err) {
+    if (err.code === "ENOENT") return { removed: true, path: real };
     return { removed: false, path: real, error: err.code ?? err.message };
   }
 }

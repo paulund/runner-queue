@@ -266,11 +266,56 @@ test("the work directory itself can never be removed", async () => {
   assert.equal(result.removed, false);
 });
 
-test("a path that has already gone is not an error worth reporting", async () => {
+test("a directory that has already gone counts as removed", async () => {
+  // The runner clears `_work` itself as jobs finish, so a checkout scanned a
+  // moment ago can be gone by the time it is deleted. The intended state was
+  // reached, so this is a success, not a failure that should exit 1.
   const { root } = await workTree({ "acme/api/main": 50 });
   const result = await removeCheckout(root, join(root, "acme", "api", "gone"));
+  assert.equal(result.removed, true);
+  assert.equal(result.error, undefined);
+});
+
+test("a checkout removed between the scan and the delete is not a failure", async () => {
+  // Regression: `ENOENT` was reported as an error, so two overlapping `clean`
+  // runs -- routine from cron -- made the loser exit 1 having done its job.
+  const { root, now } = await workTree({ "acme/api/main": 50 });
+  const found = await scanWorkDir({ root, now });
+  const [target] = staleCheckouts(found.checkouts, 24).stale;
+
+  const { rm } = await import("node:fs/promises");
+  await rm(target.path, { recursive: true, force: true });
+
+  const result = await removeCheckout(found.root, target.path);
+  assert.equal(result.removed, true);
+  assert.equal(result.error, undefined);
+});
+
+test("a real removal failure is still a failure", async () => {
+  // The ENOENT case must not swallow EACCES, or the safety valve above stops
+  // meaning anything.
+  const { root } = await workTree({ "acme/api/main": 50 });
+  const result = await removeCheckout(root, join(root, "acme", "api", "main"), {
+    fs: {
+      realpath: async (p) => p,
+      rm: async () => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+    },
+  });
   assert.equal(result.removed, false);
-  assert.ok(result.error, "but the reason is still returned");
+  assert.equal(result.error, "EACCES");
+});
+
+test("a symlink whose target has vanished still resolves to a refusal, not a success", async () => {
+  // A broken symlink cannot be realpath'd. Treating that as "already gone" would
+  // be wrong: the thing it pointed at may still be there.
+  const { root } = await workTree({ "acme/api/main": 50 });
+  const escape = join(root, "acme", "api", "escape");
+  await symlink("/nonexistent/target", escape);
+
+  const result = await removeCheckout(root, escape);
+  assert.equal(result.removed, true, "the dangling link itself is gone, which is fine");
 });
 
 // --- the report `clean` writes --------------------------------------------
