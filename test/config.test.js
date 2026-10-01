@@ -21,6 +21,20 @@ const writeConfig = async (dir, body) => {
   return file;
 };
 
+/**
+ * An empty environment, so a developer's real `~/.config/runner-queue/` cannot
+ * decide what a test asserts.
+ *
+ * `XDG_CONFIG_HOME` is the lever that works here, and it is worth knowing why.
+ * `xdgConfigHome` falls back to `homedir()` when it is unset, and `homedir()`
+ * reads the real process environment -- not the `env` object passed to
+ * `loadConfig`. So setting `HOME` in that object does nothing at all, and
+ * `env: {}` is not isolation, it is a request for the actual home directory.
+ * Pointing `XDG_CONFIG_HOME` at a fresh temporary directory is the one override
+ * that is read from the object that was passed.
+ */
+const noHome = async () => ({ XDG_CONFIG_HOME: await tmp() });
+
 test("an unknown key is rejected rather than ignored", async () => {
   const file = await writeConfig(await tmp(), { thresholdMinuts: 5 });
   await assert.rejects(() => loadConfig({ path: file }), /unknown key "thresholdMinuts"/);
@@ -60,7 +74,7 @@ test("RUNNER_QUEUE_CONFIG pointing at a missing file is an error, not a fallback
 });
 
 test("defaults apply when no config file exists", async () => {
-  const config = await loadConfig({ cwd: await tmp(), env: {}, flags: new Map() });
+  const config = await loadConfig({ cwd: await tmp(), env: await noHome(), flags: new Map() });
   assert.equal(config.source, "defaults");
   assert.equal(config.thresholdMinutes, 10);
   assert.equal(config.includeArchived, false);
@@ -222,7 +236,7 @@ test("a boolean given something that is not a boolean is rejected", async () => 
 test("an empty environment variable is unset, not a value", async () => {
   const config = await loadConfig({
     cwd: await tmp(),
-    env: { RUNNER_QUEUE_ORG: "", RUNNER_QUEUE_THRESHOLD_MINUTES: "" },
+    env: { ...(await noHome()), RUNNER_QUEUE_ORG: "", RUNNER_QUEUE_THRESHOLD_MINUTES: "" },
     flags: new Map(),
   });
   assert.deepEqual(config.orgs, []);

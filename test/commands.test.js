@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs, OPTIONS } from "../src/args.js";
-import { COMMANDS, cmdJobs, cmdWait } from "../src/commands.js";
+import { COMMANDS, cmdClean, cmdJobs, cmdWait } from "../src/commands.js";
 import { SCHEMA, loadConfig } from "../src/config.js";
 import { EXIT } from "../src/errors.js";
 
@@ -86,11 +86,24 @@ const history = (over = {}) => ({
 
 // --- the command table ---
 
-test("there are exactly the two commands this tool is for", () => {
-  assert.deepEqual(Object.keys(COMMANDS), ["jobs", "wait"]);
+test("there are exactly the commands this tool is for", () => {
+  assert.deepEqual(Object.keys(COMMANDS), ["jobs", "wait", "clean"]);
   for (const [name, spec] of Object.entries(COMMANDS)) {
     assert.equal(typeof spec.run, "function", name);
     assert.match(spec.summary, /\S/, `${name} needs a summary`);
+  }
+});
+
+test("only clean can delete anything, and only with --apply", () => {
+  // The property that has to survive any future command: `clean` is the only
+  // command that removes anything, and it does not unless asked.
+  const writers = Object.entries(COMMANDS)
+    .filter(([name]) => name === "clean")
+    .map(([name]) => name);
+  assert.deepEqual(writers, ["clean"]);
+
+  for (const flag of ["apply", "prune"]) {
+    assert.ok(COMMANDS.clean.accepts.includes(flag), `clean should take --${flag}`);
   }
 });
 
@@ -130,6 +143,152 @@ test("every option is reachable under the name its own spec declares", () => {
     assert.deepEqual(parsed.errors, [], flag);
     assert.equal(parsed.options[spec.name], spec.type === "value" ? "x" : true, flag);
   }
+});
+
+// --- clean ---
+
+const NOW = Date.parse("2026-01-01T01:00:00Z");
+
+/** A `_work` tree with the given checkout ages in hours. */
+async function workTree(spec) {
+  const root = await mkdtemp(join(tmpdir(), "rq-clean-"));
+  for (const [rel, ageHours] of Object.entries(spec)) {
+    const path = join(root, rel);
+    await mkdir(path, { recursive: true });
+    const when = new Date(NOW - ageHours * 3_600_000);
+    await utimes(path, when, when);
+  }
+  return root;
+}
+
+/**
+ * The filesystem operations `clean` uses.
+ *
+ * `scan` and `diskUsage` are left as the real functions, pointed at a temporary
+ * tree, so the age arithmetic and the directory walk are actually exercised
+ * rather than a fixture shaped to match the implementation. `remove` and
+ * `pruneWorktrees` are stubbed, because those are the operations that must never
+ * be pointed at anything real in a test.
+ */
+const cleanDeps = (extra = {}) => ({
+  stats: async () => ({ totalBytes: 500e9, freeBytes: 400e9, freePercent: 80 }),
+  ...extra,
+});
+
+test("clean deletes nothing without --apply", async () => {
+  // The single most important property of this command.
+  const root = await workTree({ "acme/api/main": 50 });
+  const removed = [];
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { now: NOW, env: {} },
+    cleanDeps({ remove: async (_r, p) => (removed.push(p), { removed: true, path: p }) }),
+  );
+
+  assert.deepEqual(removed, [], "nothing may be deleted without --apply");
+  assert.match(result.out, /Would remove 1 checkout/);
+  assert.match(result.out, /acme\/api\/main/);
+  assert.match(result.out, /Re-run with --apply/);
+  assert.equal(result.code, EXIT.attention);
+});
+
+test("clean with --apply deletes only what is past the threshold", async () => {
+  const root = await workTree({ "acme/api/main": 50, "acme/api/dev": 2, "acme/web/main": 1 });
+  const removed = [];
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, now: NOW, env: {} },
+    cleanDeps({ remove: async (_r, p) => (removed.push(p), { removed: true, path: p }) }),
+  );
+
+  assert.equal(removed.length, 1);
+  assert.match(result.out, /Removed 1 checkout/);
+  // The fresh checkouts are named as kept, so the ones left behind cannot be
+  // mistaken for ones that were removed too.
+  assert.match(result.out, /Kept 2/);
+  assert.match(result.out, /acme\/api\/dev/);
+});
+
+test("clean reports nothing to do when everything is fresh", async () => {
+  const root = await workTree({ "acme/api/main": 1 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.match(result.out, /Nothing to clean/);
+});
+
+test("clean needs a work directory and says where to set one", async () => {
+  // Thrown, not returned: it is a "you have not told us something we need"
+  // message, so it belongs with the other config errors and on stderr.
+  const cfg = await config({ workDir: null });
+  await assert.rejects(
+    () => cmdClean(cfg, { env: {} }, cleanDeps()),
+    /no work directory to clean/,
+  );
+});
+
+test("clean uses the runner's own RUNNER_WORK when nothing is configured", async () => {
+  // The runner exports this for every job, which is why `clean` needs no
+  // configuration to run on the machine it is cleaning.
+  const root = await workTree({ "acme/api/main": 50 });
+  const result = await cmdClean(
+    await config({ workDir: null }),
+    { now: NOW, env: { RUNNER_WORK: root } },
+    cleanDeps(),
+  );
+  assert.match(result.out, /Would remove 1 checkout/);
+});
+
+test("clean prunes git worktrees once per repository, not per stale ref", async () => {
+  const root = await workTree({ "acme/api/main": 50, "acme/api/release": 60, "acme/web/main": 40 });
+  const pruned = [];
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, prune: true, now: NOW, env: {} },
+    cleanDeps({ pruneTrees: async (p) => (pruned.push(p), { ok: true, output: "" }) }),
+  );
+
+  assert.equal(pruned.length, 2, "two repositories, not three refs");
+  assert.ok(pruned.every((p) => !p.endsWith("/main") && !p.endsWith("/release")));
+});
+
+test("clean can be told not to prune at all", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const pruned = [];
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, prune: false, now: NOW, env: {} },
+    cleanDeps({ pruneTrees: async (p) => (pruned.push(p), { ok: true, output: "" }) }),
+  );
+  assert.deepEqual(pruned, []);
+});
+
+test("a failed removal is an error, not a quiet partial success", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, now: NOW, env: {} },
+    cleanDeps({ remove: async (_r, p) => ({ removed: false, path: p, error: "EACCES" }) }),
+  );
+  assert.equal(result.code, EXIT.error);
+  assert.match(result.out, /1 removal\(s\) failed/);
+  assert.match(result.out, /EACCES/);
+});
+
+test("clean --json reports what it did as data", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24 }),
+    { apply: true, json: true, now: NOW, env: {} },
+    cleanDeps(),
+  );
+  const parsed = JSON.parse(result.out);
+  assert.equal(parsed.applied, true);
+  assert.equal(parsed.staleWorkDirs, 1);
+  assert.equal(parsed.cleanedBy[0].repo, "acme/api");
+  assert.equal(parsed.cleanedBy[0].ageHours, 50);
 });
 
 // --- jobs ---

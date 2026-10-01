@@ -132,10 +132,31 @@ test("a flag with no value is an error, not a silently skipped flag", async () =
   assert.match(stderr, /--org needs a value/);
 });
 
-test("neither command takes arguments, so passing one is an error", async () => {
-  const { code, stderr } = await rq(["jobs", "extra"]);
+test("no command takes arguments, so passing one is an error", async () => {
+  for (const command of Object.keys(COMMANDS)) {
+    const { code, stderr } = await rq([command, "extra"]);
+    assert.equal(code, 1, command);
+    assert.match(stderr, /takes no arguments/, command);
+  }
+});
+
+test("clean runs without an organisation, because it never talks to GitHub", async () => {
+  // The whole point of `clean` is that it can be run on the runner it is
+  // cleaning, where nobody has configured a token or an org for it.
+  const { code, stderr } = await rq(["clean"], { env: cleanEnv(await tmp()) });
   assert.equal(code, 1);
-  assert.match(stderr, /takes no arguments/);
+  assert.doesNotMatch(stderr, /No organisation/);
+  assert.match(stderr, /no work directory to clean/);
+});
+
+test("a destructive action cannot be switched on in a config file", async () => {
+  // --apply is an option, not a setting. A config file naming it must be
+  // rejected, or the flag could be turned on once and left on forever.
+  const dir = await tmp();
+  await writeFile(join(dir, "runner-queue.config.json"), JSON.stringify({ apply: true }));
+  const { code, stderr } = await rq(["--work-dir", dir, "clean"], { cwd: dir });
+  assert.equal(code, 1);
+  assert.match(stderr, /unknown key "apply"/);
 });
 
 test("running without an organisation explains every way to set one", async () => {

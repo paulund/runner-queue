@@ -59,7 +59,7 @@ function helpText(pkg) {
     .map(([name, spec]) => [
       name,
       Object.entries(OPTIONS)
-        .filter(([flag]) => spec.accepts.includes(flag))
+        .filter(([flag]) => spec.accepts?.includes(flag))
         .map(([flag, opt]) => optionRows(flag, opt)),
     ]);
 
@@ -163,7 +163,7 @@ async function main(argv) {
 
   const config = await loadConfig({ path: parsed.options.config, flags: parsed.flags });
 
-  if (!config.orgs.length) {
+  if (spec.needsOrg !== false && !config.orgs.length) {
     err(
       [
         "No organisation configured.",
@@ -192,6 +192,9 @@ async function main(argv) {
     ...parsed.options,
     positionals: parsed.positionals,
     style,
+    // One clock for the whole run, so that a decision and the number printed
+    // beside it cannot disagree about when "now" was.
+    now: Date.now(),
   });
 
   out(result.out);
