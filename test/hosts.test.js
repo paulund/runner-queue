@@ -8,6 +8,7 @@ import {
   diskUsage,
   freePercentFor,
   hostIndex,
+  hostReport,
   hostReportFor,
   isFresh,
   pressureFor,
@@ -270,4 +271,52 @@ test("a path that has already gone is not an error worth reporting", async () =>
   const result = await removeCheckout(root, join(root, "acme", "api", "gone"));
   assert.equal(result.removed, false);
   assert.ok(result.error, "but the reason is still returned");
+});
+
+// --- the report `clean` writes --------------------------------------------
+
+const cleanup = (over = {}) => ({
+  runner: "runner-01",
+  root: "/opt/actions-runner/_work",
+  disk: { totalBytes: 500e9, freeBytes: 5e9, freePercent: 1 },
+  checkouts: [{ rel: "acme/api/main" }, { rel: "acme/api/dev" }],
+  stale: [{ rel: "acme/api/main" }],
+  removed: [{ rel: "acme/api/main", removed: true }],
+  pruned: 2,
+  errors: [],
+  now: Date.parse("2026-01-01T00:00:00Z"),
+  ...over,
+});
+
+test("a report is stamped, so staleness can be detected when it is read", () => {
+  assert.equal(
+    hostReport(cleanup()).at,
+    "2026-01-01T00:00:00.000Z",
+  );
+});
+
+test("a report falls back to the hostname when no runner declared itself", () => {
+  assert.equal(hostReport(cleanup({ runner: null, hostname: "build07" })).runner, "build07");
+});
+
+test("a report counts rather than listing, because it is written after the removals", () => {
+  const rep = hostReport(cleanup());
+  // An inventory taken before the removals would describe directories that are
+  // now gone, and `jobs` reads this to judge whether a disk is full.
+  assert.equal(rep.cleanedBy, undefined);
+  assert.equal(rep.workDirCount, 2);
+  assert.equal(rep.staleWorkDirs, 1);
+  assert.equal(rep.removedWorkDirs, 1);
+});
+
+test("a report counts only the removals that worked", () => {
+  const rep = hostReport(cleanup({ removed: [{ removed: true }, { removed: false, error: "EACCES" }] }));
+  assert.equal(rep.removedWorkDirs, 1);
+});
+
+test("a report with no disk figures is still a report", () => {
+  // A host that cannot stat its disk should still be identifiable.
+  const rep = hostReport(cleanup({ disk: null }));
+  assert.equal(rep.disk, null);
+  assert.equal(rep.runner, "runner-01");
 });

@@ -27,7 +27,7 @@ the same one applied harder:
 - **It deletes nothing without `--apply`.** The default is a dry run.
 - **`--apply` is an option, not a setting.** A destructive action that a config
   file can switch on is a destructive action that will eventually be switched on
-  by accident. `--apply` and `--prune` live in `OPTIONS`.
+  by accident. `--apply`, `--prune` and `--report` live in `OPTIONS`.
 - **Deletion happens behind an age threshold** (`--cleanup-age-hours`), checked
   before anything is removed rather than at the point of removal. A directory
   still in use has a recent mtime; that is the whole of the safety.
@@ -66,6 +66,10 @@ than reaching for a live API in a test.
 tree, so the age arithmetic and the directory walk are actually exercised.
 `remove` and `pruneWorktrees` are stubbed, because those are the operations that
 must never be pointed at anything real in a test.
+
+The report writer is left real too, in one test, because the name of the file
+and the `runner` field inside it have to agree — a stub returning a fixed path
+would not notice if they diverged.
 
 Tests worth reading before you touch the code they cover, because each exists
 because it caught a real bug:

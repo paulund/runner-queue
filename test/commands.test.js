@@ -372,6 +372,85 @@ test("a failed removal is an error, not a quiet partial success", async () => {
   assert.match(result.out, /EACCES/);
 });
 
+test("clean writes a host report naming the runner, for jobs to read back", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const saved = [];
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: "/reports" }),
+    { apply: true, report: true, runner: "runner-07", hostname: "build07", now: NOW, env: {} },
+    cleanDeps({
+      save: async (dir, name, rep) => {
+        saved.push({ dir, name, rep });
+        return "/reports/runner-07.json";
+      },
+    }),
+  );
+
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].name, "runner-07");
+  assert.equal(saved[0].rep.runner, "runner-07");
+  assert.equal(saved[0].rep.staleWorkDirs, 1);
+  assert.equal(saved[0].rep.removedWorkDirs, 1);
+  assert.equal(saved[0].rep.disk.freePercent, 80);
+  // `at` is what makes staleness detectable on the reading side.
+  assert.equal(saved[0].rep.at, new Date(NOW).toISOString());
+  assert.match(result.out, /Host report written to/);
+});
+
+test("the host report carries counts, not a list of directories that may be gone", async () => {
+  // The report is written after the removals, so an inventory taken before them
+  // would describe directories that no longer exist -- and `jobs` reads this to
+  // judge whether a disk is full.
+  const root = await workTree({ "acme/api/main": 50, "acme/api/dev": 2 });
+  let written = null;
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: "/reports" }),
+    { apply: true, report: true, now: NOW, env: {} },
+    cleanDeps({ save: async (_d, _n, rep) => ((written = rep), "/reports/x.json") }),
+  );
+
+  assert.equal(written.cleanedBy, undefined);
+  assert.equal(written.workDirCount, 2);
+  assert.equal(written.staleWorkDirs, 1);
+});
+
+test("a dry run still reports, because a nearly-full host is true either way", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const saved = [];
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: "/reports" }),
+    { report: true, now: NOW, env: {} },
+    cleanDeps({ save: async (_d, _n, rep) => (saved.push(rep), "/reports/x.json") }),
+  );
+
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].staleWorkDirs, 1, "the report says there is something to clean");
+  assert.equal(saved[0].removedWorkDirs, 0, "and that nothing was removed");
+});
+
+test("no report is written without --report", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const saved = [];
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: "/reports" }),
+    { apply: true, now: NOW, env: {} },
+    cleanDeps({ save: async () => (saved.push(1), "/reports/x.json") }),
+  );
+
+  assert.deepEqual(saved, []);
+  assert.doesNotMatch(result.out, /Host report written/);
+});
+
+test("asking for a report with no directory set says so rather than doing nothing", async () => {
+  const root = await workTree({ "acme/api/main": 50 });
+  const result = await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: null }),
+    { apply: true, report: true, now: NOW, env: {} },
+    cleanDeps({ save: async () => null }),
+  );
+  assert.match(result.out, /no host report directory is set/);
+});
+
 test("clean --json reports what it did as data", async () => {
   const root = await workTree({ "acme/api/main": 50 });
   const result = await cmdClean(
@@ -384,6 +463,51 @@ test("clean --json reports what it did as data", async () => {
   assert.equal(parsed.staleWorkDirs, 1);
   assert.equal(parsed.cleanedBy[0].repo, "acme/api");
   assert.equal(parsed.cleanedBy[0].ageHours, 50);
+});
+
+test("the file written is named after the runner and says so inside", async () => {
+  // The real writer, not a stub: the name on disk and the `runner` field inside
+  // it have to agree, or `jobs` cannot match the report to anything.
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "runner-07", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+
+  const written = JSON.parse(await readFile(join(dir, "runner-07.json"), "utf8"));
+  assert.equal(written.runner, "runner-07");
+  assert.equal(written.hostname, "build07");
+  assert.equal(typeof written.disk.freePercent, "number");
+});
+
+test("a host with no runner name falls back to the hostname", async () => {
+  // Run by hand rather than from a job, there is no RUNNER_NAME. The report is
+  // still attributable, which is the only thing that makes it matchable.
+  const root = await workTree({ "acme/api/main": 50 });
+  const dir = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: null, hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+
+  const written = JSON.parse(await readFile(join(dir, "build07.json"), "utf8"));
+  assert.equal(written.runner, "build07");
+});
+
+test("the report directory is created if it is not there yet", async () => {
+  // The point is that `clean --report` can run from a job with no prior setup.
+  const root = await workTree({ "acme/api/main": 50 });
+  const base = await mkdtemp(join(tmpdir(), "rq-reports-"));
+  const dir = join(base, "not", "there", "yet");
+  await cmdClean(
+    await config({ workDir: root, cleanupAgeHours: 24, hostReportDir: dir }),
+    { report: true, runner: "runner-07", hostname: "build07", now: NOW, env: {} },
+    cleanDeps(),
+  );
+  assert.ok((await readFile(join(dir, "runner-07.json"), "utf8")).length > 0);
 });
 
 // --- jobs ---

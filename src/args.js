@@ -32,6 +32,11 @@ export const OPTIONS = {
     name: "prune",
     help: "clean: also run `git worktree prune` in each checkout",
   },
+  report: {
+    type: "boolean",
+    name: "report",
+    help: "clean: write a host report for `jobs` to read later",
+  },
   "exit-zero": {
     type: "boolean",
   

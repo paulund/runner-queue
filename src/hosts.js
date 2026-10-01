@@ -192,6 +192,49 @@ export async function diskUsage(path) {
   }
 }
 
+/**
+ * Builds the report `clean --report` writes and `jobs --host-report-dir` reads.
+ * The same shape both ways, deliberately: one side produces it and the other
+ * consumes it, and two shapes would mean a conversion to keep in step.
+ *
+ * Carries counts, not a list of the directories it found. A report is written
+ * *after* the removals, so an inventory taken beforehand describes directories
+ * that no longer exist -- and `jobs` reads this to judge whether a disk is full,
+ * where a stale inventory is worse than none.
+ *
+ * @param {{ runner?: string | null, hostname?: string | null, root?: string | null,
+ *   disk?: any, checkouts?: any[], stale?: any[], removed?: any[],
+ *   pruned: number, errors?: any[], now?: number }} input
+ */
+export function hostReport({
+  runner,
+  hostname,
+  root,
+  disk,
+  checkouts = [],
+  stale = [],
+  removed = [],
+  pruned = 0,
+  errors = [],
+  now = Date.now(),
+}) {
+  return {
+    // Falls back to the hostname, so a report written by hand outside a runner
+    // is still attributable -- which is the only thing that makes it matchable.
+    runner: runner ?? hostname ?? null,
+    hostname: hostname ?? null,
+    // What makes staleness detectable on the reading side.
+    at: new Date(now).toISOString(),
+    workDir: root ?? null,
+    disk: disk ?? null,
+    workDirCount: checkouts.length,
+    staleWorkDirs: stale.length,
+    removedWorkDirs: removed.filter((r) => r.removed).length,
+    prunedWorktrees: pruned,
+    errors,
+  };
+}
+
 // --- scanning -------------------------------------------------------------
 
 /** True when `child` is inside `root`. Both are expected to be resolved. */
