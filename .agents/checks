@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Local checks that replace remote CI (.github/workflows/ci.yml).
+#   .agents/checks          full: clean install from the lockfile, then the CI steps
+#   .agents/checks --fast   typecheck and unit tests against installed dependencies
+# CI runs on Node 22 and 24; locally this runs once on whatever Node is installed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+fast=false
+case "${1:-}" in
+  "") ;;
+  --fast) fast=true ;;
+  *) echo "usage: .agents/checks [--fast]" >&2; exit 2 ;;
+esac
+
+section() { printf '\n==> %s\n' "$1"; }
+
+export NO_COLOR=1
+
+section "node $(node --version)"
+
+if ! $fast; then
+  section "npm ci"
+  npm ci --no-audit --no-fund
+fi
+
+section "typecheck"
+npm run --silent typecheck
+
+section "test"
+npm test
+
+section "all checks passed"
